@@ -26,8 +26,8 @@ VIP_REASON = 0
 
 
 # ── Keyboards ───────────────────────────────────────────────
-def _main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton("\U0001f50d Extract Cookies", callback_data="extract")],
         [
             InlineKeyboardButton("\U0001f4ca My Stats", callback_data="mystats"),
@@ -37,7 +37,10 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("\U0001f451 Get VIP", callback_data="getvip"),
             InlineKeyboardButton("\u2753 Help", callback_data="help"),
         ],
-    ])
+    ]
+    if user_id is not None and user_id == config.ADMIN_ID:
+        rows.append([InlineKeyboardButton("\U0001f6e0 Admin Panel", callback_data="adm_panel")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _back_home_kb() -> InlineKeyboardMarkup:
@@ -100,7 +103,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Welcome, {user.first_name}!\n\n"
         f"{quota_line}{vip_line}"
     )
-    await update.message.reply_text(text, reply_markup=_main_menu_kb())  # type: ignore[union-attr]
+    await update.message.reply_text(text, reply_markup=_main_menu_kb(user.id))  # type: ignore[union-attr]
 
 
 # ── Home callback ───────────────────────────────────────────
@@ -129,7 +132,7 @@ async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Welcome, {user.first_name}!\n\n"
         f"{quota_line}{vip_line}"
     )
-    await query.edit_message_text(text, reply_markup=_main_menu_kb())
+    await query.edit_message_text(text, reply_markup=_main_menu_kb(user.id))
 
 
 # ── /mystats ────────────────────────────────────────────────

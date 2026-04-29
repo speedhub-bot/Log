@@ -26,6 +26,12 @@ _telethon_started = False
 async def _get_telethon():
     """Return a started Telethon client (singleton)."""
     global _telethon_client, _telethon_started
+    if not config.SESSION_STRING:
+        raise RuntimeError(
+            "SESSION_STRING is not configured. "
+            "Large file downloads (>20 MB) require a Telethon session string. "
+            "See README for generation instructions."
+        )
     if _telethon_client is None:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
