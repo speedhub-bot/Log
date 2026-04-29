@@ -21,9 +21,9 @@ def _str(key: str, default: str) -> str:
 
 
 # ── Telegram ────────────────────────────────────────────────
-BOT_TOKEN: str = _str("BOT_TOKEN", "")
+BOT_TOKEN: str = _str("BOT_TOKEN", "8482556356:AAFYFKTA_FFFpAaz2tRsgKtalbOrwptPkVY")
 API_ID: int = _int("API_ID", 31206680)
-API_HASH: str = _str("API_HASH", "")
+API_HASH: str = _str("API_HASH", "39d0b0430309434e7ab02ab1742dd170")
 ADMIN_ID: int = _int("ADMIN_ID", 5944410248)
 SESSION_STRING: str = _str("SESSION_STRING", "")
 
