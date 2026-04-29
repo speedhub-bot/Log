@@ -645,11 +645,12 @@ async def download_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     log_path = config.LOG_FILE
     if os.path.exists(log_path):
-        await context.bot.send_document(
-            chat_id=update.effective_user.id,  # type: ignore[union-attr]
-            document=open(log_path, "rb"),
-            filename="bot.log",
-        )
+        with open(log_path, "rb") as fh:
+            await context.bot.send_document(
+                chat_id=update.effective_user.id,  # type: ignore[union-attr]
+                document=fh,
+                filename="bot.log",
+            )
 
 
 # ── Jobs ───────────────────────────────────────────────────

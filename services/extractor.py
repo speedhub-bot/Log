@@ -211,15 +211,35 @@ class ExtractionResult:
     duration_seconds: float = 0.0
 
 
+def _safe_zip_extract(zf: zipfile.ZipFile, dest: str) -> None:
+    """Extract zip with path traversal protection."""
+    dest_real = os.path.realpath(dest)
+    for member in zf.namelist():
+        target = os.path.realpath(os.path.join(dest, member))
+        if not target.startswith(dest_real + os.sep) and target != dest_real:
+            raise ValueError(f"Path traversal detected in zip: {member}")
+    zf.extractall(dest)
+
+
+def _safe_tar_extract(tf: tarfile.TarFile, dest: str) -> None:
+    """Extract tar with path traversal protection."""
+    dest_real = os.path.realpath(dest)
+    for member in tf.getmembers():
+        target = os.path.realpath(os.path.join(dest, member.name))
+        if not target.startswith(dest_real + os.sep) and target != dest_real:
+            raise ValueError(f"Path traversal detected in tar: {member.name}")
+    tf.extractall(dest)
+
+
 def _extract_archive(archive_path: str, dest: str) -> None:
     """Extract an archive into *dest* using the appropriate tool."""
     lower = archive_path.lower()
     if lower.endswith(".zip"):
         with zipfile.ZipFile(archive_path, "r") as zf:
-            zf.extractall(dest)
+            _safe_zip_extract(zf, dest)
     elif lower.endswith((".tar.gz", ".tgz", ".tar.bz2")):
         with tarfile.open(archive_path, "r:*") as tf:
-            tf.extractall(dest)
+            _safe_tar_extract(tf, dest)
     else:
         # .rar / .7z — delegate to patool
         import patoolib
