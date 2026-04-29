@@ -222,13 +222,18 @@ def _safe_zip_extract(zf: zipfile.ZipFile, dest: str) -> None:
 
 
 def _safe_tar_extract(tf: tarfile.TarFile, dest: str) -> None:
-    """Extract tar with path traversal protection."""
+    """Extract tar with path traversal and symlink protection."""
     dest_real = os.path.realpath(dest)
+    safe_members = []
     for member in tf.getmembers():
+        if member.issym() or member.islnk():
+            logger.warning("Skipping symlink/hardlink in tar: {}", member.name)
+            continue
         target = os.path.realpath(os.path.join(dest, member.name))
         if not target.startswith(dest_real + os.sep) and target != dest_real:
             raise ValueError(f"Path traversal detected in tar: {member.name}")
-    tf.extractall(dest)
+        safe_members.append(member)
+    tf.extractall(dest, members=safe_members)
 
 
 def _extract_archive(archive_path: str, dest: str) -> None:
