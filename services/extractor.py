@@ -246,8 +246,20 @@ def _extract_archive(archive_path: str, dest: str) -> None:
         with tarfile.open(archive_path, "r:*") as tf:
             _safe_tar_extract(tf, dest)
     else:
-        # .rar / .7z — delegate to patool
+        # .rar / .7z — delegate to patool (requires system tools)
+        import shutil as _shutil
+
         import patoolib
+
+        has_tool = (
+            _shutil.which("unrar") or _shutil.which("7z") or _shutil.which("unar")
+        )
+        if not has_tool:
+            raise RuntimeError(
+                "No extraction tool found for this archive format. "
+                "Install unrar or p7zip-full on the server: "
+                "sudo apt-get install -y unrar p7zip-full"
+            )
         patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
 
 
