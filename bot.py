@@ -193,11 +193,20 @@ def main() -> None:
     # Ensure temp dir exists
     config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Check for system tools needed by archive extraction
+    import shutil as _shutil
+
+    if not (_shutil.which("unrar") or _shutil.which("7z") or _shutil.which("unar")):
+        logger.warning(
+            "No RAR/7z extractor found! Install with: sudo apt-get install -y unrar p7zip-full"
+        )
+
     logger.info("Starting Cookie Extractor Bot...")
 
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
+        .concurrent_updates(True)
         .build()
     )
 
