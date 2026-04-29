@@ -32,7 +32,7 @@ from db import database as db
 from services.downloader import download_file
 from services.extractor import ExtractionProgress, run_extraction_async
 from services.queue import JobQueue, QueueItem
-from utils.formatting import bytes_human, progress_bar, seconds_human
+from utils.formatting import bytes_human, progress_bar, seconds_human, time_until
 from utils.validators import validate_archive, validate_domain
 
 # Conversation states
@@ -256,6 +256,7 @@ async def _process_job(
     """Download, extract, send results — runs inside the queue worker."""
     start_ts = time.monotonic()
     temp_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
+    result = None  # set before try so finally can reference it safely
 
     try:
         await db.update_job(job_id, status="processing", started_at=db._now())
@@ -306,11 +307,12 @@ async def _process_job(
             try:
                 file_size = os.path.getsize(fpath)
                 if file_size > 0:
-                    await context.bot.send_document(
-                        chat_id=user_id,
-                        document=open(fpath, "rb"),
-                        filename=os.path.basename(fpath),
-                    )
+                    with open(fpath, "rb") as fh:
+                        await context.bot.send_document(
+                            chat_id=user_id,
+                            document=fh,
+                            filename=os.path.basename(fpath),
+                        )
             except Exception:
                 logger.exception("Failed to send result file {}", fpath)
 
@@ -352,11 +354,13 @@ async def _process_job(
     finally:
         _active_progress.pop(job_id, None)
         shutil.rmtree(temp_dir, ignore_errors=True)
-        # Clean output dir from extractor
-        for fpath in (await db.get_job(job_id) or {}).get("output_files", []):
-            parent = os.path.dirname(fpath)
-            if parent and os.path.isdir(parent):
-                shutil.rmtree(parent, ignore_errors=True)
+        # Clean output dir created by the extractor
+        if result and result.output_files:
+            for fpath in result.output_files:
+                parent = os.path.dirname(fpath)
+                if parent and os.path.isdir(parent):
+                    shutil.rmtree(parent, ignore_errors=True)
+                    break  # all chunks share the same output dir
 
 
 async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> None:
