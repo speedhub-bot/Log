@@ -787,47 +787,64 @@ def _extract_archive(
             "apt-get install -y p7zip-full unrar"
         )
 
-    first_exc: Optional[Exception] = None
+    unrar_path = _shutil.which("unrar")
+    sevenz_path = _shutil.which("7z")
+    logger.info(
+        "Extracting {} (sniffed={}); available tools: unrar={}, 7z={}",
+        archive_path, sniffed, unrar_path, sevenz_path,
+    )
+
+    errors: List[str] = []
 
     # Try unrar first for .rar files (best RAR5 + encrypted-entry support).
-    if sniffed == "rar" and _shutil.which("unrar"):
+    if sniffed == "rar" and unrar_path:
+        logger.info("Trying unrar first for {}", archive_path)
         try:
             _extract_with_unrar(archive_path, dest, progress)
+            logger.info("unrar extraction succeeded for {}", archive_path)
             return
         except ValueError:
             raise
         except Exception as exc:
             logger.warning("unrar extraction failed ({}), falling back to 7z", exc)
-            first_exc = exc
+            errors.append(f"unrar: {exc}")
 
     # Try 7z next.
+    if sevenz_path:
+        logger.info("Trying 7z for {}", archive_path)
+        try:
+            _extract_with_7z(archive_path, dest, progress)
+            logger.info("7z extraction succeeded for {}", archive_path)
+            return
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("7z extraction failed ({}), trying patoolib", exc)
+            errors.append(f"7z: {exc}")
+
+    # Last resort: patoolib.
+    logger.info("Trying patoolib as final fallback for {}", archive_path)
     try:
-        _extract_with_7z(archive_path, dest, progress)
+        import patoolib
+        with _DirCountPoller(dest, progress):
+            patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
+        _validate_extracted_paths(dest)
+        logger.info("patoolib extraction succeeded for {}", archive_path)
         return
     except ValueError:
         raise
     except Exception as exc:
-        # Last resort: patoolib. It has no progress callback and no stdin
-        # protection, but handles some formats 7z/unrar don't (e.g. ACE).
-        logger.warning("7z extraction failed ({}), trying patoolib as last resort", exc)
-        try:
-            import patoolib
-            with _DirCountPoller(dest, progress):
-                patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
-            _validate_extracted_paths(dest)
-            return
-        except ValueError:
-            raise
-        except Exception as exc2:
-            parts = []
-            if first_exc is not None:
-                parts.append(f"unrar: {first_exc}")
-            parts.append(f"7z: {exc}")
-            parts.append(f"patoolib: {exc2}")
-            raise RuntimeError(
-                "All extraction tools failed on this archive. "
-                + "; ".join(parts)
-            ) from exc2
+        errors.append(f"patoolib: {exc}")
+
+    # Everything failed. Surface every tool's error — truncate each
+    # tool's message so the combined string stays within Telegram's
+    # 4096-char message limit.
+    combined = "; ".join(
+        f"[{e[:700]}{'...' if len(e) > 700 else ''}]" for e in errors
+    )
+    raise RuntimeError(
+        f"All extraction tools failed on this archive. Errors: {combined}"
+    )
 
 
 def _ext_kind(lower_path: str) -> Optional[str]:
