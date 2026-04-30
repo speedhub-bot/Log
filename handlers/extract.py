@@ -14,11 +14,12 @@ import os
 import shutil
 import tempfile
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 from loguru import logger
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -30,7 +31,11 @@ from telegram.ext import (
 import config
 from db import database as db
 from services.downloader import download_file
-from services.extractor import ExtractionProgress, run_extraction_async
+from services.extractor import (
+    ExtractionProgress,
+    probe_encrypted_entries_async,
+    run_extraction_async,
+)
 from services.queue import JobQueue, QueueItem
 from utils.formatting import bytes_human, progress_bar, seconds_human, time_until
 from utils.validators import validate_archive, validate_domain
@@ -43,6 +48,16 @@ _job_queue: JobQueue | None = None
 
 # Active progress trackers: job_id -> ExtractionProgress
 _active_progress: Dict[int, ExtractionProgress] = {}
+
+# Pending password requests: user_id -> Future that the user's next plain
+# text message (or /skip command) resolves. Value is the password string,
+# or None if the user chose /skip (extract only unencrypted entries).
+_pending_passwords: Dict[int, "asyncio.Future[Optional[str]]"] = {}
+
+# How long to wait for the user to reply with a password before we
+# auto-skip and proceed with ``-p-``. Keeps stuck jobs from pinning a
+# queue worker forever.
+PASSWORD_PROMPT_TIMEOUT = 300.0  # 5 minutes
 
 
 def _cancel_kb() -> InlineKeyboardMarkup:
@@ -269,8 +284,18 @@ async def _process_job(
         # Download
         archive_path = await download_file(original_msg, temp_dir, progress)
 
+        # Password-protected entry probe. If the archive contains
+        # encrypted entries, ask the user for the password before we
+        # kick off extraction — otherwise those entries would be
+        # skipped silently and the cookies inside them would be lost.
+        password = await _maybe_prompt_for_password(
+            context, user_id, archive_path, progress_msg, job_id,
+        )
+
         # Extract
-        result = await run_extraction_async(archive_path, domain, progress)
+        result = await run_extraction_async(
+            archive_path, domain, progress, password=password,
+        )
 
         updater_task.cancel()
         try:
@@ -386,6 +411,151 @@ async def _process_job(
                 if parent and os.path.isdir(parent):
                     shutil.rmtree(parent, ignore_errors=True)
                     break  # all chunks share the same output dir
+
+
+async def _maybe_prompt_for_password(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    archive_path: str,
+    progress_msg,
+    job_id: int,
+) -> "str | None":
+    """Probe *archive_path* for encrypted entries. If any exist, ask the
+    user for the archive password in chat and wait for their reply.
+
+    Returns the password to use for extraction, or ``None`` to proceed
+    without one (user chose /skip or didn't reply in time).
+    """
+    try:
+        encrypted = await probe_encrypted_entries_async(archive_path)
+    except Exception:
+        logger.exception("Password probe failed on {}", archive_path)
+        return None
+
+    if not encrypted:
+        return None
+
+    # Show up to three sample names so the user knows what's locked.
+    sample = ", ".join(encrypted[:3])
+    if len(encrypted) > 3:
+        sample += f", +{len(encrypted) - 3} more"
+    text = (
+        f"\U0001f510 This archive has {len(encrypted)} password-protected "
+        f"file(s):\n<code>{sample}</code>\n\n"
+        "Reply with the archive password to extract everything, or tap "
+        "<b>Skip</b> to extract only the unencrypted files."
+    )
+    try:
+        await progress_msg.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "\u23ed Skip encrypted", callback_data=f"skip_pw_{job_id}"
+                ),
+                InlineKeyboardButton(
+                    "\u274c Cancel Job", callback_data=f"cancel_job_{job_id}"
+                ),
+            ]]),
+        )
+    except Exception:
+        logger.exception("Failed to edit progress msg for password prompt")
+
+    # Create the waiter and let the catch-all message handler fill it.
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Optional[str]] = loop.create_future()
+    # Replace any previous pending request for this user — last one wins.
+    prev = _pending_passwords.get(user_id)
+    if prev is not None and not prev.done():
+        prev.cancel()
+    _pending_passwords[user_id] = fut
+
+    try:
+        password = await asyncio.wait_for(fut, timeout=PASSWORD_PROMPT_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.info(
+            "Password prompt timed out for user {} job {}; proceeding without",
+            user_id, job_id,
+        )
+        password = None
+        try:
+            await progress_msg.edit_text(
+                "\u23f3 No password received \u2014 extracting only the "
+                "unencrypted files\u2026",
+                reply_markup=_cancel_job_kb(job_id),
+            )
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        password = None
+    finally:
+        _pending_passwords.pop(user_id, None)
+
+    if password is None:
+        try:
+            await progress_msg.edit_text(
+                "\u23ed Skipping encrypted entries \u2014 extracting the rest\u2026",
+                reply_markup=_cancel_job_kb(job_id),
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            await progress_msg.edit_text(
+                "\U0001f511 Password received \u2014 extracting\u2026",
+                reply_markup=_cancel_job_kb(job_id),
+            )
+        except Exception:
+            pass
+    return password
+
+
+async def password_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fill a pending password request with the user's next text message."""
+    user = update.effective_user
+    if user is None or update.message is None:
+        return
+    fut = _pending_passwords.get(user.id)
+    if fut is None or fut.done():
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    # ``/skip`` as a plain word doubles as a shortcut to the skip flow.
+    if text.lower() in ("/skip", "skip"):
+        fut.set_result(None)
+    else:
+        fut.set_result(text)
+    # Try to delete the message so the password doesn't linger in chat.
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    # Stop other handlers (e.g. an active /extract conversation state)
+    # from also consuming the same message.
+    raise ApplicationHandlerStop
+
+
+async def skip_password_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle the inline 'Skip encrypted' button."""
+    query = update.callback_query
+    if query is None or update.effective_user is None:
+        return
+    await query.answer()
+    fut = _pending_passwords.get(update.effective_user.id)
+    if fut is not None and not fut.done():
+        fut.set_result(None)
+
+
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /skip command as an alternative to the inline button."""
+    if update.effective_user is None:
+        return
+    fut = _pending_passwords.get(update.effective_user.id)
+    if fut is not None and not fut.done():
+        fut.set_result(None)
 
 
 async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> None:
@@ -570,3 +740,19 @@ def register(app, job_queue: JobQueue) -> None:
 
     # Job cancel callback (works outside conversation)
     app.add_handler(CallbackQueryHandler(cancel_job_callback, pattern=r"^cancel_job_\d+$"))
+
+    # Archive-password prompt handlers. Registered in a negative group so
+    # they run ahead of the generic conversation handlers and catch the
+    # user's reply even though the /extract conversation has already ended
+    # (the password wait happens inside the queue worker).
+    app.add_handler(CommandHandler("skip", skip_command), group=-1)
+    app.add_handler(
+        CallbackQueryHandler(skip_password_callback, pattern=r"^skip_pw_\d+$"),
+        group=-1,
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND, password_reply,
+        ),
+        group=-1,
+    )

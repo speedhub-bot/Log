@@ -274,6 +274,69 @@ def _safe_tar_extract(
 
 
 
+def _probe_encrypted_entries(archive_path: str) -> List[str]:
+    """Return a list of password-protected entry names inside *archive_path*.
+
+    Returns an empty list if the archive has no encrypted entries, or if
+    we can't tell (missing tools, unknown format). Never raises.
+
+    Detection order:
+      * For ``.rar``: prefer ``unrar lt -p-`` and look for ``Flags: enc``.
+      * Fallback / other formats: ``7z l -slt`` and look for
+        ``Encrypted = +``.
+    """
+    import shutil as _shutil
+
+    lower = archive_path.lower()
+    encrypted: List[str] = []
+
+    if lower.endswith(".rar"):
+        unrar = _shutil.which("unrar")
+        if unrar:
+            try:
+                proc = subprocess.run(
+                    [unrar, "lt", "-p-", archive_path],
+                    capture_output=True, text=True, timeout=60,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                # ``lt`` (technical listing) emits blocks like:
+                #     Name: foo.txt
+                #     ...
+                #     Flags: encrypted
+                # We parse blocks split on "Name:" lines.
+                blocks = re.split(r"(?m)^Name:\s+", proc.stdout)
+                for blk in blocks[1:]:
+                    first_nl = blk.find("\n")
+                    name = blk[:first_nl].strip() if first_nl >= 0 else blk.strip()
+                    if re.search(r"(?mi)^\s*Flags:.*encrypted", blk):
+                        encrypted.append(name)
+                if encrypted:
+                    return encrypted
+            except Exception as exc:
+                logger.debug("unrar probe failed ({}); falling back", exc)
+
+    sz = _shutil.which("7z")
+    if sz:
+        try:
+            proc = subprocess.run(
+                [sz, "l", "-slt", archive_path],
+                capture_output=True, text=True, timeout=60,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            cur_name: Optional[str] = None
+            for line in proc.stdout.splitlines():
+                if line.startswith("Path = "):
+                    cur_name = line[len("Path = "):].strip()
+                elif line.startswith("Encrypted = +") and cur_name:
+                    encrypted.append(cur_name)
+        except Exception as exc:
+            logger.debug("7z probe failed ({})", exc)
+
+    return encrypted
+
+
 def _is_split_archive(path: str) -> bool:
     """Detect split/multipart archive naming patterns."""
     base = os.path.basename(path).lower()
@@ -385,6 +448,7 @@ def _extract_with_7z(
     archive_path: str,
     dest: str,
     progress: Optional["ExtractionProgress"] = None,
+    password: Optional[str] = None,
 ) -> None:
     """Extract using 7z command-line tool with live per-file progress.
 
@@ -406,10 +470,13 @@ def _extract_with_7z(
     # archives with encrypted headers (``-mhe=on``) require the password
     # to even read the file list, and 7z would otherwise hang prompting
     # before extraction even begins.
+    list_cmd = [sz, "l", "-slt", archive_path]
+    if password:
+        list_cmd.append(f"-p{password}")
     if progress is not None:
         try:
             count_proc = subprocess.run(
-                [sz, "l", "-slt", archive_path],
+                list_cmd,
                 capture_output=True, text=True, timeout=60,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
@@ -442,9 +509,14 @@ def _extract_with_7z(
     #     directly to bypass stdin (some builds do that), the open fails.
     # Combined effect: 7z fails any password-protected entry with a
     # non-zero exit code rather than blocking forever.
+    extract_cmd = [
+        sz, "x", archive_path, f"-o{dest}", "-y",
+        "-bb1", "-bso2", "-bse2", "-bsp2",
+    ]
+    if password:
+        extract_cmd.append(f"-p{password}")
     proc = subprocess.Popen(
-        [sz, "x", archive_path, f"-o{dest}", "-y",
-         "-bb1", "-bso2", "-bse2", "-bsp2"],
+        extract_cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -563,6 +635,7 @@ def _extract_with_unrar(
     archive_path: str,
     dest: str,
     progress: Optional["ExtractionProgress"] = None,
+    password: Optional[str] = None,
 ) -> None:
     """Extract a .rar archive with the proprietary ``unrar`` binary.
 
@@ -581,11 +654,16 @@ def _extract_with_unrar(
     if not unrar:
         raise RuntimeError("unrar not found")
 
+    # ``-p<password>`` unlocks encrypted entries without prompting.
+    # ``-p-`` keeps the old skip-encrypted behaviour when no password
+    # was provided.
+    pw_flag = f"-p{password}" if password else "-p-"
+
     # Count entries first for the progress bar.
     if progress is not None:
         try:
             count_proc = subprocess.run(
-                [unrar, "lb", "-p-", archive_path],
+                [unrar, "lb", pw_flag, archive_path],
                 capture_output=True, text=True, timeout=60,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
@@ -607,7 +685,7 @@ def _extract_with_unrar(
     # ``-y``   yes to all queries
     # ``-idq`` quiet mode (reduce noise)
     proc = subprocess.Popen(
-        [unrar, "x", "-p-", "-o+", "-y", archive_path, dest + os.sep],
+        [unrar, "x", pw_flag, "-o+", "-y", archive_path, dest + os.sep],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -715,6 +793,7 @@ def _extract_archive(
     archive_path: str,
     dest: str,
     progress: Optional["ExtractionProgress"] = None,
+    password: Optional[str] = None,
 ) -> None:
     """Extract an archive into *dest* using the best available tool.
 
@@ -738,7 +817,7 @@ def _extract_archive(
     # Split archives — go straight to 7z
     if _is_split_archive(archive_path):
         logger.info("Split archive detected, using 7z: {}", archive_path)
-        _extract_with_7z(archive_path, dest, progress)
+        _extract_with_7z(archive_path, dest, progress, password=password)
         return
 
     # Determine the real archive format from the file's magic bytes; if
@@ -765,8 +844,10 @@ def _extract_archive(
             sniffed, _ext_kind(lower),
         )
 
-    # Pure-Python zip
-    if sniffed == "zip":
+    # Pure-Python zip. Skip it when a password is provided; stdlib
+    # ``zipfile`` only supports the weak ZipCrypto password format, and
+    # falling straight to 7z gives us AES-protected zip support for free.
+    if sniffed == "zip" and not password:
         try:
             with zipfile.ZipFile(archive_path, "r") as zf:
                 _safe_zip_extract(zf, dest, progress)
@@ -775,8 +856,11 @@ def _extract_archive(
             raise
         except Exception as exc:
             logger.warning("zipfile failed ({}), falling back to 7z", exc)
-            _extract_with_7z(archive_path, dest, progress)
+            _extract_with_7z(archive_path, dest, progress, password=password)
             return
+    if sniffed == "zip":  # password provided — go straight to 7z
+        _extract_with_7z(archive_path, dest, progress, password=password)
+        return
 
     # Pure-Python tarball (gzip / bzip2 / xz / plain tar)
     if sniffed in ("gz", "bz2", "xz"):
@@ -788,7 +872,7 @@ def _extract_archive(
             raise
         except Exception as exc:
             logger.warning("tarfile failed ({}), falling back to 7z", exc)
-            _extract_with_7z(archive_path, dest, progress)
+            _extract_with_7z(archive_path, dest, progress, password=password)
             return
 
     # .rar / .7z / unknown.
@@ -829,7 +913,7 @@ def _extract_archive(
     if sniffed == "rar" and unrar_path:
         logger.info("Trying unrar first for {}", archive_path)
         try:
-            _extract_with_unrar(archive_path, dest, progress)
+            _extract_with_unrar(archive_path, dest, progress, password=password)
             logger.info("unrar extraction succeeded for {}", archive_path)
             return
         except ValueError:
@@ -842,7 +926,7 @@ def _extract_archive(
     if sevenz_path:
         logger.info("Trying 7z for {}", archive_path)
         try:
-            _extract_with_7z(archive_path, dest, progress)
+            _extract_with_7z(archive_path, dest, progress, password=password)
             logger.info("7z extraction succeeded for {}", archive_path)
             return
         except ValueError:
@@ -927,6 +1011,7 @@ def _run_extraction(
     archive_path: str,
     domain: str,
     progress: ExtractionProgress,
+    password: Optional[str] = None,
 ) -> ExtractionResult:
     """Blocking extraction — meant to run inside ``asyncio.to_thread``."""
     import time
@@ -941,7 +1026,7 @@ def _run_extraction(
         progress.extract_start = time.monotonic()
         progress.current_file = ""
         logger.info("Extracting archive {} into {}", archive_path, temp_dir)
-        _extract_archive(archive_path, temp_dir, progress)
+        _extract_archive(archive_path, temp_dir, progress, password=password)
 
         if progress.cancelled:
             # Nothing useful to send if the user cancelled mid-extraction.
@@ -1031,6 +1116,14 @@ async def run_extraction_async(
     archive_path: str,
     domain: str,
     progress: ExtractionProgress,
+    password: Optional[str] = None,
 ) -> ExtractionResult:
     """Non-blocking facade — offloads heavy work to a thread."""
-    return await asyncio.to_thread(_run_extraction, archive_path, domain, progress)
+    return await asyncio.to_thread(
+        _run_extraction, archive_path, domain, progress, password
+    )
+
+
+async def probe_encrypted_entries_async(archive_path: str) -> List[str]:
+    """Async wrapper around ``_probe_encrypted_entries``."""
+    return await asyncio.to_thread(_probe_encrypted_entries, archive_path)
