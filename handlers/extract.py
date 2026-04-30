@@ -278,24 +278,38 @@ async def _process_job(
         except asyncio.CancelledError:
             pass
 
-        if not result.success:
+        # Hard failure (no partial output to ship).
+        if not result.success and not result.output_files:
+            duration = time.monotonic() - start_ts
             await db.update_job(
-                job_id, status="failed", error_message=result.error,
+                job_id,
+                status="cancelled" if result.partial else "failed",
+                error_message=result.error,
                 completed_at=db._now(),
-                duration_seconds=time.monotonic() - start_ts,
+                duration_seconds=duration,
             )
             await progress_msg.edit_text(
-                f"\u274c Extraction failed: {result.error}",
+                ("\u26a0\ufe0f Cancelled: " if result.partial else "\u274c Extraction failed: ")
+                + (result.error or "unknown error"),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f50d Try Again", callback_data="extract"),
+                     InlineKeyboardButton("\U0001f3e0 Home", callback_data="home")],
+                ]),
             )
-            _notify_admin_error(context, user_id, "extraction", result.error)
+            if not result.partial:
+                _notify_admin_error(context, user_id, "extraction", result.error)
             return
 
-        # Update DB
+        # Update DB — success path (or cancelled with partial output)
         duration = time.monotonic() - start_ts
         await db.update_job(
-            job_id, status="done", cookies_found=result.cookies_found,
-            files_scanned=result.files_scanned, completed_at=db._now(),
+            job_id,
+            status="cancelled" if result.partial else "done",
+            cookies_found=result.cookies_found,
+            files_scanned=result.files_scanned,
+            completed_at=db._now(),
             duration_seconds=duration,
+            error_message="Cancelled \u2014 partial results" if result.partial else None,
         )
         await db.increment_user_stats(
             user_id, result.cookies_found,
@@ -308,10 +322,15 @@ async def _process_job(
                 file_size = os.path.getsize(fpath)
                 if file_size > 0:
                     with open(fpath, "rb") as fh:
+                        caption = (
+                            "\u26a0\ufe0f Partial results (job cancelled)"
+                            if result.partial else None
+                        )
                         await context.bot.send_document(
                             chat_id=user_id,
                             document=fh,
                             filename=os.path.basename(fpath),
+                            caption=caption,
                         )
             except Exception:
                 logger.exception("Failed to send result file {}", fpath)
@@ -320,14 +339,19 @@ async def _process_job(
         file_size = job_row["file_size_bytes"] if job_row else 0  # type: ignore[index]
 
         # Summary
+        header = (
+            "\u26a0\ufe0f Cancelled \u2014 partial results delivered"
+            if result.partial else "\u2705 Extraction Complete!"
+        )
         summary = (
-            f"\u2705 Extraction Complete!\n\n"
+            f"{header}\n\n"
             f"\U0001f310 Domain: {domain}\n"
             f"\U0001f36a Cookies found: {result.cookies_found:,}\n"
             f"\U0001f4c1 Files scanned: {result.files_scanned:,}\n"
             f"\U0001f4e6 Archive size: {bytes_human(file_size)}\n"
             f"\u23f1 Time taken: {seconds_human(duration)}\n"
-            f"\U0001f4c4 Output files: {len(result.output_files)}"
+            f"\U0001f4c4 Output files: {len(result.output_files)}\n\n"
+            f"\U0001f338 Credits: @akaza_isnt"
         )
         await progress_msg.edit_text(
             summary,
@@ -336,6 +360,7 @@ async def _process_job(
                     InlineKeyboardButton("\U0001f50d Extract Again", callback_data="extract"),
                     InlineKeyboardButton("\U0001f4ca My Stats", callback_data="mystats"),
                 ],
+                [InlineKeyboardButton("\U0001f3e0 Home", callback_data="home")],
             ]),
         )
 
@@ -364,8 +389,9 @@ async def _process_job(
 
 
 async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> None:
-    """Edit the progress message every few seconds."""
+    """Edit the progress message every few seconds with a live dashboard."""
     start = time.monotonic()
+    last_text = ""
     while True:
         await asyncio.sleep(config.PROGRESS_UPDATE_INTERVAL)
         elapsed = time.monotonic() - start
@@ -374,43 +400,92 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                 pct = (
                     progress.download_current / max(progress.download_total, 1) * 100
                 )
-                dl_elapsed = time.monotonic() - progress.download_start if progress.download_start else elapsed
+                dl_elapsed = (
+                    time.monotonic() - progress.download_start
+                    if progress.download_start else elapsed
+                )
                 speed = progress.download_current / max(dl_elapsed, 0.001)
-                remaining_bytes = max(progress.download_total - progress.download_current, 0)
+                remaining_bytes = max(
+                    progress.download_total - progress.download_current, 0
+                )
                 eta = remaining_bytes / max(speed, 1)
                 text = (
-                    f"\u2699\ufe0f Processing your archive...\n\n"
-                    f"\U0001f4e5 Downloading: {progress_bar(progress.download_current, progress.download_total)} "
-                    f"{pct:.0f}% ({bytes_human(progress.download_current)}/{bytes_human(progress.download_total)})\n"
+                    f"\u2699\ufe0f Live Dashboard\n"
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    f"\U0001f4e5 Downloading\n"
+                    f"   {progress_bar(progress.download_current, progress.download_total)} {pct:.0f}%\n"
+                    f"   {bytes_human(progress.download_current)} / "
+                    f"{bytes_human(progress.download_total)}\n"
                     f"\U0001f4c8 Speed: {bytes_human(int(speed))}/s\n"
-                    f"\u23f1 ETA: {seconds_human(eta)}\n"
-                    f"\u23f1 Elapsed: {seconds_human(elapsed)}"
+                    f"\u23f1 ETA: {seconds_human(eta)}   Elapsed: {seconds_human(elapsed)}"
                 )
             elif progress.phase == "extracting":
+                cur_file = progress.current_file or "…"
+                if len(cur_file) > 40:
+                    cur_file = cur_file[:37] + "…"
+                if progress.extract_total > 0:
+                    pct = (
+                        progress.extract_current
+                        / max(progress.extract_total, 1) * 100
+                    )
+                    bar = (
+                        f"   {progress_bar(progress.extract_current, progress.extract_total)} "
+                        f"{pct:.0f}% "
+                        f"({progress.extract_current:,}/{progress.extract_total:,})\n"
+                    )
+                else:
+                    bar = f"   Files extracted: {progress.extract_current:,}\n"
                 text = (
-                    f"\u2699\ufe0f Processing your archive...\n\n"
-                    f"\U0001f4e5 Downloading: Done \u2705\n"
-                    f"\U0001f4c2 Extracting archive...\n"
+                    f"\u2699\ufe0f Live Dashboard\n"
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    f"\U0001f4e5 Download:  Done \u2705\n"
+                    f"\U0001f4c2 Extracting\n"
+                    f"{bar}"
+                    f"   Now: {cur_file}\n"
                     f"\u23f1 Elapsed: {seconds_human(elapsed)}"
                 )
             elif progress.phase == "scanning":
+                cur_file = progress.current_file or "…"
+                if len(cur_file) > 40:
+                    cur_file = cur_file[:37] + "…"
+                pct = (
+                    progress.files_scanned
+                    / max(progress.files_total, 1) * 100
+                )
+                rate = progress.files_scanned / max(elapsed, 0.001)
+                eta = (
+                    (progress.files_total - progress.files_scanned)
+                    / max(rate, 0.001)
+                    if progress.files_total else 0
+                )
                 text = (
-                    f"\u2699\ufe0f Processing your archive...\n\n"
-                    f"\U0001f4e5 Downloading: Done \u2705\n"
-                    f"\U0001f4c2 Extracting: Done \u2705\n"
-                    f"\U0001f50d Scanning: {progress_bar(progress.files_scanned, progress.files_total)} "
-                    f"{progress.files_scanned}/{progress.files_total} files\n"
-                    f"\U0001f36a Found so far: {progress.cookies_found:,}\n\n"
+                    f"\u2699\ufe0f Live Dashboard\n"
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    f"\U0001f4e5 Download:  Done \u2705\n"
+                    f"\U0001f4c2 Extract:   Done \u2705\n"
+                    f"\U0001f50d Scanning\n"
+                    f"   {progress_bar(progress.files_scanned, progress.files_total)} "
+                    f"{pct:.0f}% ({progress.files_scanned:,}/{progress.files_total:,})\n"
+                    f"   Now: {cur_file}\n"
+                    f"\U0001f36a Cookies found so far: "
+                    f"{progress.cookies_found:,}\n"
+                    f"\u26a1 Rate: {rate:.1f} files/s   ETA: {seconds_human(eta)}\n"
                     f"\u23f1 Elapsed: {seconds_human(elapsed)}"
                 )
             else:
                 continue
 
+            if text == last_text:
+                continue
+            last_text = text
             await msg.edit_text(
                 text,
                 reply_markup=_cancel_job_kb(job_id),
             )
         except Exception:
+            # Telegram throws "Message is not modified" if the text/buttons
+            # haven't changed since the last edit — silently ignore so the
+            # updater keeps running.
             pass
 
 

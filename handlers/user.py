@@ -25,7 +25,13 @@ from utils.formatting import bytes_human, number_human, seconds_human, time_unti
 VIP_REASON = 0
 
 
-# ── Keyboards ───────────────────────────────────────────────
+# Brand strings
+BOT_TITLE = "\U0001f36a Cookie Extractor Bot"
+BOT_TAGLINE = "Fast, GB-scale cookie extraction from logs"
+BOT_CREDIT = "\U0001f338 Made with care \u2014 credits to @akaza_isnt"
+
+
+# ── Keyboards ─────────────────────────────────────────────
 def _main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("\U0001f50d Extract Cookies", callback_data="extract")],
@@ -37,6 +43,7 @@ def _main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
             InlineKeyboardButton("\U0001f451 Get VIP", callback_data="getvip"),
             InlineKeyboardButton("\u2753 Help", callback_data="help"),
         ],
+        [InlineKeyboardButton("\u2139\ufe0f About / Credits", callback_data="about")],
     ]
     if user_id is not None and user_id == config.ADMIN_ID:
         rows.append([InlineKeyboardButton("\U0001f6e0 Admin Panel", callback_data="adm_panel")])
@@ -98,11 +105,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     elif vip:
         vip_line = "\n\U0001f451 VIP (forever)"
 
-    text = (
-        f"\U0001f36a Cookie Extractor Bot\n"
-        f"Welcome, {user.first_name}!\n\n"
-        f"{quota_line}{vip_line}"
-    )
+    text = _welcome_text(user.first_name or "friend", quota_line, vip_line)
     await update.message.reply_text(text, reply_markup=_main_menu_kb(user.id))  # type: ignore[union-attr]
 
 
@@ -127,12 +130,56 @@ async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     elif vip:
         vip_line = "\n\U0001f451 VIP (forever)"
 
-    text = (
-        f"\U0001f36a Cookie Extractor Bot\n"
-        f"Welcome, {user.first_name}!\n\n"
-        f"{quota_line}{vip_line}"
-    )
+    text = _welcome_text(user.first_name or "friend", quota_line, vip_line)
     await query.edit_message_text(text, reply_markup=_main_menu_kb(user.id))
+
+
+def _welcome_text(name: str, quota_line: str, vip_line: str) -> str:
+    """Render the main /start + home greeting."""
+    return (
+        f"{BOT_TITLE}\n"
+        f"{BOT_TAGLINE}\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f44b Hey {name}!\n\n"
+        "Tap \U0001f50d Extract Cookies to get started \u2014 send a domain, "
+        "upload your archive, watch the live dashboard, and receive your "
+        "cookies as text files.\n\n"
+        f"{quota_line}{vip_line}\n\n"
+        f"{BOT_CREDIT}"
+    )
+
+
+# ── /about ──────────────────────────────────────────────────
+ABOUT_TEXT = (
+    "\u2139\ufe0f About / Credits\n"
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+    f"{BOT_TITLE}\n"
+    f"{BOT_TAGLINE}\n\n"
+    "\u2699\ufe0f Features\n"
+    "\u2022 Live extraction dashboard \u2014 cookies counter, files "
+    "scanned, ETA, current file\n"
+    "\u2022 Cancel a job and still get the cookies found so far\n"
+    "\u2022 GB-scale support: zip / rar / 7z / tar.gz, up to 10 GB for VIP\n"
+    "\u2022 Magic-byte content detection \u2014 ext mismatches don\u2019t crash the job\n"
+    "\u2022 Parallel MTProto download (16 concurrent chunks)\n"
+    "\u2022 Priority queue, daily quotas, anti-spam, admin panel\n\n"
+    f"{BOT_CREDIT}\n"
+    "\U0001f4ac Issues / suggestions: contact @akaza_isnt"
+)
+
+
+async def about_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    await query.edit_message_text(ABOUT_TEXT, reply_markup=_back_home_kb())
+
+
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    await update.message.reply_text(ABOUT_TEXT, reply_markup=_back_home_kb())
 
 
 # ── /mystats ────────────────────────────────────────────────
@@ -227,7 +274,10 @@ HELP_PAGES = {
         "Free tier limits:\n"
         "\u2022 2 GB daily quota\n"
         "\u2022 Max 2 GB per file\n"
-        "\u2022 Standard queue"
+        "\u2022 Standard queue\n\n"
+        "\U0001f4a1 Tip: cancel a running job and the bot still sends "
+        "the cookies it has already found.\n\n"
+        + BOT_CREDIT
     ),
 }
 
@@ -376,8 +426,11 @@ def register(app) -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("mystats", mystats_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("credits", about_command))
 
     app.add_handler(CallbackQueryHandler(home_callback, pattern="^home$"))
     app.add_handler(CallbackQueryHandler(mystats_callback, pattern="^mystats$"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help(_page_\d+)?$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings$"))
+    app.add_handler(CallbackQueryHandler(about_callback, pattern="^about$"))

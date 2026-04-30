@@ -48,7 +48,7 @@ QUOTA_ABUSE_WARNS: int = 3        # auto-ban threshold
 
 # ── Output ──────────────────────────────────────────────────
 OUTPUT_CHUNK_SIZE_BYTES: int = 45 * 1024 * 1024    # 45 MB per result file
-PROGRESS_UPDATE_INTERVAL: float = 3.0              # seconds
+PROGRESS_UPDATE_INTERVAL: float = 2.0              # seconds (live dashboard refresh)
 QUEUE_UPDATE_INTERVAL: float = 30.0                # seconds
 
 # ── Cleanup ─────────────────────────────────────────────────
