@@ -4,15 +4,19 @@ Production-grade Telegram bot for extracting cookies from Netscape-format archiv
 
 ## Features
 
-- **Cookie Extraction** — Extracts domain-specific cookies from `.zip`, `.rar`, `.7z`, `.tar.gz` archives
-- **Large File Support** — Files >20 MB downloaded via Pyrogram MTProto client (up to 10 GB for VIP)
+- **Cookie Extraction** — Extracts domain-specific cookies from `.zip`, `.rar`, `.7z`, `.tar.gz` archives. Routing is by **content (magic bytes)**, not extension, so a `.zip`-named 7z file still extracts cleanly.
+- **Live Dashboard** — Per-phase progress: download speed/ETA, extraction file counter (`current/total`), scanning files-per-second, **live cookies-found counter**, and the file currently being processed. Refreshes every 2 s.
+- **Cancel-with-partial-results** — Hit cancel on a running job and the bot still ships whatever cookies it has already found, captioned as partial results.
+- **Large File Support** — All files downloaded via Pyrogram MTProto with **16 parallel chunk transfers** (up to 10 GB for VIP). Configurable via `PYROGRAM_MAX_TRANSMISSIONS`.
 - **Queue System** — Async priority queue with VIP skip-ahead and configurable concurrency
 - **Quota System** — Per-user daily byte limits with midnight UTC reset
 - **VIP Membership** — Unlimited quota, priority queue, larger file limits
 - **Admin Panel** — Full control: user management, stats, broadcasts, settings, logs
 - **Anti-Abuse** — Rate limiting, spam detection, domain blacklisting, auto-ban
-- **Live Progress** — Real-time progress messages updated every 3 seconds
+- **Slash-command Menu** — `/start`, `/extract`, `/mystats`, `/help`, `/about`, `/cancel` registered with Telegram so they appear in the in-app command picker.
 - **Scheduled Tasks** — APScheduler for VIP expiry, quota reset, temp cleanup, daily reports
+
+Credits: bot is maintained by [@akaza_isnt](https://t.me/akaza_isnt).
 
 ## Project Structure
 

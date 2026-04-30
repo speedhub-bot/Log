@@ -30,9 +30,13 @@ _pyro_started: bool = False
 
 MIN_EDIT_INTERVAL = 1.0
 
-# Parallel chunk transfers — higher = faster on high-bandwidth servers.
-# Each transmission uses a separate TCP connection to Telegram DC.
-MAX_CONCURRENT_TRANSMISSIONS = 10
+# Parallel chunk transfers within a single download — higher = faster on
+# high-bandwidth servers. Pyrogram tops out around 50; bot-token sessions
+# typically saturate well below that, but 16 noticeably outperforms the
+# previous default of 10 on big files (>200 MB).
+MAX_CONCURRENT_TRANSMISSIONS = int(
+    os.getenv("PYROGRAM_MAX_TRANSMISSIONS", "16")
+)
 
 
 async def _get_pyrogram() -> Client:
@@ -108,7 +112,8 @@ async def download_file(
     start_ts = time.monotonic()
     last_update = start_ts
 
-    async def _progress_cb(current: int, total: int) -> None:
+    def _progress_cb(current: int, total: int) -> None:
+        # Pyrogram calls this synchronously from its IO loop; keep it cheap.
         nonlocal last_update
         progress.download_current = current
         progress.download_total = total

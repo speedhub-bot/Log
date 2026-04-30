@@ -218,12 +218,25 @@ def main() -> None:
     # Global error handler
     app.add_error_handler(error_handler)
 
-    # Post-init: start queue + scheduler
+    # Post-init: start queue + scheduler + register slash-command menu
     async def post_init(application) -> None:
         await db.get_db()
         await job_queue.start()
         _setup_scheduler()
         scheduler.start()
+        try:
+            from telegram import BotCommand
+
+            await application.bot.set_my_commands([
+                BotCommand("start", "Open the main menu"),
+                BotCommand("extract", "Extract cookies from an archive"),
+                BotCommand("mystats", "Show your usage stats"),
+                BotCommand("help", "How to use the bot"),
+                BotCommand("about", "About this bot / credits"),
+                BotCommand("cancel", "Cancel the current conversation"),
+            ])
+        except Exception:
+            logger.exception("Failed to register slash-command menu")
         logger.info("Bot initialised — DB ready, queue started, scheduler running")
 
     async def post_shutdown(application) -> None:

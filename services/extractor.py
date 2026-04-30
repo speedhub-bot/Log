@@ -198,6 +198,10 @@ class ExtractionProgress:
     download_current: int = 0
     download_total: int = 0
     download_start: float = 0.0     # monotonic timestamp when download began
+    extract_total: int = 0          # total members in the archive (when known)
+    extract_current: int = 0        # members already written to disk
+    extract_start: float = 0.0      # monotonic timestamp when extraction began
+    current_file: str = ""          # name of the file currently being processed
     cancelled: bool = False
 
 
@@ -210,20 +214,40 @@ class ExtractionResult:
     files_scanned: int = 0
     error: str = ""
     duration_seconds: float = 0.0
+    partial: bool = False           # True when results came from a cancelled job
 
 
-def _safe_zip_extract(zf: zipfile.ZipFile, dest: str) -> None:
-    """Extract zip with path traversal protection."""
+def _safe_zip_extract(
+    zf: zipfile.ZipFile,
+    dest: str,
+    progress: Optional["ExtractionProgress"] = None,
+) -> None:
+    """Extract zip with path traversal protection and per-member progress."""
     dest_real = os.path.realpath(dest)
-    for member in zf.namelist():
+    members = zf.namelist()
+    for member in members:
         target = os.path.realpath(os.path.join(dest, member))
         if not target.startswith(dest_real + os.sep) and target != dest_real:
             raise ValueError(f"Path traversal detected in zip: {member}")
-    zf.extractall(dest)
+    if progress is not None:
+        progress.extract_total = len(members)
+        progress.extract_current = 0
+    for name in members:
+        if progress is not None and progress.cancelled:
+            return
+        if progress is not None:
+            progress.current_file = os.path.basename(name) or name
+        zf.extract(name, dest)
+        if progress is not None:
+            progress.extract_current += 1
 
 
-def _safe_tar_extract(tf: tarfile.TarFile, dest: str) -> None:
-    """Extract tar with path traversal and symlink protection."""
+def _safe_tar_extract(
+    tf: tarfile.TarFile,
+    dest: str,
+    progress: Optional["ExtractionProgress"] = None,
+) -> None:
+    """Extract tar with path traversal/symlink protection and per-member progress."""
     dest_real = os.path.realpath(dest)
     safe_members = []
     for member in tf.getmembers():
@@ -234,7 +258,17 @@ def _safe_tar_extract(tf: tarfile.TarFile, dest: str) -> None:
         if not target.startswith(dest_real + os.sep) and target != dest_real:
             raise ValueError(f"Path traversal detected in tar: {member.name}")
         safe_members.append(member)
-    tf.extractall(dest, members=safe_members)
+    if progress is not None:
+        progress.extract_total = len(safe_members)
+        progress.extract_current = 0
+    for member in safe_members:
+        if progress is not None and progress.cancelled:
+            return
+        if progress is not None:
+            progress.current_file = os.path.basename(member.name) or member.name
+        tf.extract(member, dest)
+        if progress is not None:
+            progress.extract_current += 1
 
 
 
@@ -298,8 +332,17 @@ def _validate_extracted_paths(dest: str) -> None:
                 raise ValueError(f"Path traversal detected after extraction: {name}")
 
 
-def _extract_with_7z(archive_path: str, dest: str) -> None:
-    """Extract using 7z command-line tool (handles split archives, damaged files, etc.)."""
+def _extract_with_7z(
+    archive_path: str,
+    dest: str,
+    progress: Optional["ExtractionProgress"] = None,
+) -> None:
+    """Extract using 7z command-line tool with live per-file progress.
+
+    7z's ``-bsp1`` option streams progress lines to stderr. We parse them
+    so the bot can show ``extract_current / extract_total`` while the
+    process runs.
+    """
     import shutil as _shutil
 
     sz = _shutil.which("7z")
@@ -307,18 +350,72 @@ def _extract_with_7z(archive_path: str, dest: str) -> None:
         raise RuntimeError(
             "7z not found. Install with: apt-get install -y p7zip-full"
         )
-    result = subprocess.run(
-        [sz, "x", archive_path, f"-o{dest}", "-y", "-bso0", "-bse1"],
-        capture_output=True,
+
+    # First, count entries so we can show a real progress bar.
+    if progress is not None:
+        try:
+            count_proc = subprocess.run(
+                [sz, "l", "-slt", archive_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            if count_proc.returncode == 0:
+                # "Path =" lines, minus the archive header line.
+                paths = [
+                    ln for ln in count_proc.stdout.splitlines()
+                    if ln.startswith("Path = ")
+                ]
+                progress.extract_total = max(len(paths) - 1, 0)
+                progress.extract_current = 0
+        except Exception as exc:
+            logger.debug("7z list failed ({}); progress count unavailable", exc)
+
+    # Stream extraction with line-buffered stderr so we can update progress.
+    proc = subprocess.Popen(
+        [sz, "x", archive_path, f"-o{dest}", "-y", "-bso0", "-bse1", "-bsp1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=600,
+        bufsize=1,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"7z extraction failed: {result.stderr.strip()}")
+    stderr_chunks: List[str] = []
+    deadline = None  # we don't enforce a hard timeout here; cancellation handles that
+    try:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+            line = line.strip()
+            if not line:
+                continue
+            if progress is not None:
+                # 7z progress lines look like: "  3% 12 - relative/path/inside/archive"
+                # We only care about counting per-file lines.
+                if " - " in line and (line[:1].isdigit() or line[:1] == " "):
+                    name = line.split(" - ", 1)[1]
+                    progress.current_file = os.path.basename(name) or name
+                    progress.extract_current += 1
+            if progress is not None and progress.cancelled:
+                proc.terminate()
+                break
+        proc.wait(timeout=60)
+    except Exception:
+        proc.kill()
+        raise
+
+    if progress is not None and progress.cancelled:
+        # Caller will short-circuit; don't raise.
+        return
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"7z extraction failed: {''.join(stderr_chunks).strip()[:500]}"
+        )
     _validate_extracted_paths(dest)
 
 
-def _extract_archive(archive_path: str, dest: str) -> None:
+def _extract_archive(
+    archive_path: str,
+    dest: str,
+    progress: Optional["ExtractionProgress"] = None,
+) -> None:
     """Extract an archive into *dest* using the best available tool.
 
     Strategy:
@@ -341,7 +438,7 @@ def _extract_archive(archive_path: str, dest: str) -> None:
     # Split archives — go straight to 7z
     if _is_split_archive(archive_path):
         logger.info("Split archive detected, using 7z: {}", archive_path)
-        _extract_with_7z(archive_path, dest)
+        _extract_with_7z(archive_path, dest, progress)
         return
 
     # Determine the real archive format from the file's magic bytes; if
@@ -372,26 +469,26 @@ def _extract_archive(archive_path: str, dest: str) -> None:
     if sniffed == "zip":
         try:
             with zipfile.ZipFile(archive_path, "r") as zf:
-                _safe_zip_extract(zf, dest)
+                _safe_zip_extract(zf, dest, progress)
             return
         except ValueError:
             raise
         except Exception as exc:
             logger.warning("zipfile failed ({}), falling back to 7z", exc)
-            _extract_with_7z(archive_path, dest)
+            _extract_with_7z(archive_path, dest, progress)
             return
 
     # Pure-Python tarball (gzip / bzip2 / xz / plain tar)
     if sniffed in ("gz", "bz2", "xz"):
         try:
             with tarfile.open(archive_path, "r:*") as tf:
-                _safe_tar_extract(tf, dest)
+                _safe_tar_extract(tf, dest, progress)
             return
         except ValueError:
             raise
         except Exception as exc:
             logger.warning("tarfile failed ({}), falling back to 7z", exc)
-            _extract_with_7z(archive_path, dest)
+            _extract_with_7z(archive_path, dest, progress)
             return
 
     # .rar / .7z / unknown — try patoolib first, then 7z
@@ -415,7 +512,7 @@ def _extract_archive(archive_path: str, dest: str) -> None:
         raise
     except Exception as exc:
         logger.warning("patoolib failed ({}), falling back to 7z", exc)
-        _extract_with_7z(archive_path, dest)
+        _extract_with_7z(archive_path, dest, progress)
 
 
 def _ext_kind(lower_path: str) -> Optional[str]:
@@ -480,11 +577,19 @@ def _run_extraction(
     try:
         # Phase 1: extract archive
         progress.phase = "extracting"
+        progress.extract_start = time.monotonic()
+        progress.current_file = ""
         logger.info("Extracting archive {} into {}", archive_path, temp_dir)
-        _extract_archive(archive_path, temp_dir)
+        _extract_archive(archive_path, temp_dir, progress)
 
         if progress.cancelled:
-            return ExtractionResult(success=False, error="Cancelled by user")
+            # Nothing useful to send if the user cancelled mid-extraction.
+            return ExtractionResult(
+                success=False,
+                error="Cancelled by user before any files were scanned",
+                duration_seconds=time.monotonic() - start,
+                partial=True,
+            )
 
         # Phase 2: scan files
         progress.phase = "scanning"
@@ -497,10 +602,13 @@ def _run_extraction(
         progress.files_total = len(all_files)
 
         def _cookie_generator() -> Generator[str, None, None]:
-            batch_count = 0
             for fpath in all_files:
                 if progress.cancelled:
+                    # Stop the generator cleanly so any cookies already
+                    # written to the current chunk file are flushed by
+                    # _write_output_chunks' final fh.close().
                     return
+                progress.current_file = os.path.basename(fpath)
                 try:
                     cookies = extractor.extract_from_file(fpath)
                     for c in cookies:
@@ -513,14 +621,29 @@ def _run_extraction(
                 except Exception:
                     pass
                 progress.files_scanned += 1
-                batch_count += 1
 
         output_files = _write_output_chunks(_cookie_generator(), output_dir, domain)
 
-        if progress.cancelled:
-            return ExtractionResult(success=False, error="Cancelled by user")
+        # Drop empty chunk files (e.g. cancelled before any cookie was found).
+        output_files = [
+            p for p in output_files
+            if os.path.exists(p) and os.path.getsize(p) > 0
+        ]
 
         duration = time.monotonic() - start
+
+        if progress.cancelled:
+            progress.phase = "cancelled"
+            return ExtractionResult(
+                success=bool(output_files),
+                output_files=output_files,
+                cookies_found=progress.cookies_found,
+                files_scanned=progress.files_scanned,
+                duration_seconds=duration,
+                partial=True,
+                error="" if output_files else "Cancelled by user (no cookies found yet)",
+            )
+
         progress.phase = "done"
         return ExtractionResult(
             success=True,
