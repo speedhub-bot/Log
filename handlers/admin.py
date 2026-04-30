@@ -778,10 +778,10 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     import importlib
     import telegram
     try:
-        import telethon
-        tl_ver = telethon.__version__
+        import pyrogram
+        pyro_ver = pyrogram.__version__
     except Exception:
-        tl_ver = "N/A"
+        pyro_ver = "N/A"
 
     disk = shutil.disk_usage("/")
     try:
@@ -811,7 +811,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"Python: {platform.python_version()}\n"
         f"PTB: {telegram.__version__}\n"
-        f"Telethon: {tl_ver}\n\n"
+        f"Pyrogram: {pyro_ver}\n\n"
         f"Memory: {mem_str}\n"
         f"Disk: {bytes_human(disk.free)} free / {bytes_human(disk.total)} total\n"
         f"Temp files: {temp_files} ({bytes_human(temp_size)})\n\n"

@@ -25,7 +25,7 @@ BOT_TOKEN: str = _str("BOT_TOKEN", "8482556356:AAFYFKTA_FFFpAaz2tRsgKtalbOrwptPk
 API_ID: int = _int("API_ID", 31206680)
 API_HASH: str = _str("API_HASH", "39d0b0430309434e7ab02ab1742dd170")
 ADMIN_ID: int = _int("ADMIN_ID", 5944410248)
-SESSION_STRING: str = _str("SESSION_STRING", "1BVtsOLUBuycsSRJqjCj98IuvwQH1XvFk9kPjJDEkYIj2WHTRAq7xqdpC3DbrhMg4mqOiudaw_NAxzquI6DWVdmgiSYzoL8IEud1i0nPbXqpTOLJhX15AQzscKkVGnr-P3gxqY1yUuzvtlWeJ43TN39YIkqSNGdPcUh7wtYqbzQ58yHUqrzQ7OQF2aQFuXXP_aVIC3bTfh92OLzpmXcuBFJi1SCbJ9mYMVmR6gs5kG_z8kFhx1SN5KAl_9V1REVJZw14oiKkpNT2cUKfn8O43-pC3ZBW_iDewgDw-oRxolOsPet80SxjP6BA3BkoclYPRB1MTM9fKCGO9OAMuSElT6uIWr0A4hY0=")
+# SESSION_STRING is no longer needed — Pyrogram downloads via bot token directly
 
 # ── Processing ──────────────────────────────────────────────
 MAX_CONCURRENT_JOBS: int = _int("MAX_CONCURRENT_JOBS", 2)

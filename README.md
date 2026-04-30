@@ -5,7 +5,7 @@ Production-grade Telegram bot for extracting cookies from Netscape-format archiv
 ## Features
 
 - **Cookie Extraction** — Extracts domain-specific cookies from `.zip`, `.rar`, `.7z`, `.tar.gz` archives
-- **Large File Support** — Files >20 MB downloaded via Telethon user client (up to 10 GB for VIP)
+- **Large File Support** — Files >20 MB downloaded via Pyrogram MTProto client (up to 10 GB for VIP)
 - **Queue System** — Async priority queue with VIP skip-ahead and configurable concurrency
 - **Quota System** — Per-user daily byte limits with midnight UTC reset
 - **VIP Membership** — Unlimited quota, priority queue, larger file limits
@@ -27,7 +27,7 @@ handlers/
   admin.py                 # Full admin panel with all commands
 services/
   extractor.py             # SmartCookieExtractor + async wrapper
-  downloader.py            # Telethon large file downloader
+  downloader.py            # Pyrogram MTProto large file downloader
   queue.py                 # Async job queue with VIP priority
 db/
   database.py              # All async database operations
@@ -60,26 +60,10 @@ Required variables:
 - `BOT_TOKEN` — From [@BotFather](https://t.me/BotFather)
 - `API_ID` / `API_HASH` — From [my.telegram.org](https://my.telegram.org)
 - `ADMIN_ID` — Your Telegram numeric user ID
-- `SESSION_STRING` — Telethon session string (see below)
 
-### 3. Generate SESSION_STRING
+No session string needed — Pyrogram uses the bot token to download files of any size via MTProto.
 
-The session string is needed for downloading files larger than 20 MB.
-
-```bash
-python3 -c "
-from telethon.sync import TelegramClient
-from telethon.sessions import StringSession
-API_ID = int(input('API_ID: '))
-API_HASH = input('API_HASH: ')
-with TelegramClient(StringSession(), API_ID, API_HASH) as c:
-    print('Session string:', c.session.save())
-"
-```
-
-Copy the output string into your `.env` file as `SESSION_STRING`.
-
-### 4. Run
+### 3. Run
 
 ```bash
 python bot.py
