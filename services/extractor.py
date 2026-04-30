@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -322,6 +323,53 @@ def _sniff_archive_type(path: str) -> Optional[str]:
     return None
 
 
+class _DirCountPoller:
+    """Background polling thread that updates progress by counting files in *dest*.
+
+    Acts as a robust fallback when the underlying extraction tool's own
+    progress output can't be parsed (e.g. patoolib, or 7z when it streams
+    progress on a different fd than we expect). Only ever moves the counter
+    forward, never backward.
+    """
+
+    def __init__(
+        self,
+        dest: str,
+        progress: Optional["ExtractionProgress"],
+        interval: float = 1.5,
+    ) -> None:
+        self._dest = dest
+        self._progress = progress
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "_DirCountPoller":
+        if self._progress is not None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            progress = self._progress
+            if progress is None:
+                return
+            try:
+                count = 0
+                for _root, _dirs, files in os.walk(self._dest):
+                    count += len(files)
+                if count > progress.extract_current:
+                    progress.extract_current = count
+            except Exception:
+                pass
+
+
 def _validate_extracted_paths(dest: str) -> None:
     """Post-extraction check: ensure no file escaped the destination directory."""
     dest_real = os.path.realpath(dest)
@@ -339,9 +387,10 @@ def _extract_with_7z(
 ) -> None:
     """Extract using 7z command-line tool with live per-file progress.
 
-    7z's ``-bsp1`` option streams progress lines to stderr. We parse them
+    7z's ``-bsp2`` option streams progress lines to stderr. We parse them
     so the bot can show ``extract_current / extract_total`` while the
-    process runs.
+    process runs. A ``_DirCountPoller`` also runs alongside as a fallback
+    so the counter advances even if 7z's output format changes.
     """
     import shutil as _shutil
 
@@ -370,33 +419,51 @@ def _extract_with_7z(
             logger.debug("7z list failed ({}); progress count unavailable", exc)
 
     # Stream extraction with line-buffered stderr so we can update progress.
+    # 7z output-control flags:
+    #   -bb1   log level 1 (one line per extracted entry: "- relative/path")
+    #   -bso2  output stream    -> stderr (fd 2)
+    #   -bse2  error messages   -> stderr (fd 2)
+    #   -bsp2  progress info    -> stderr (fd 2)
+    # We capture stderr below and parse per-file progress lines from it.
+    # A directory-count poller runs alongside as a robust fallback so the
+    # dashboard advances even if 7z's progress output format changes.
     proc = subprocess.Popen(
-        [sz, "x", archive_path, f"-o{dest}", "-y", "-bso0", "-bse1", "-bsp1"],
+        [sz, "x", archive_path, f"-o{dest}", "-y",
+         "-bb1", "-bso2", "-bse2", "-bsp2"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
     )
     stderr_chunks: List[str] = []
-    deadline = None  # we don't enforce a hard timeout here; cancellation handles that
+    file_lines_seen = 0
     try:
         assert proc.stderr is not None
-        for line in proc.stderr:
-            stderr_chunks.append(line)
-            line = line.strip()
-            if not line:
-                continue
-            if progress is not None:
-                # 7z progress lines look like: "  3% 12 - relative/path/inside/archive"
-                # We only care about counting per-file lines.
-                if " - " in line and (line[:1].isdigit() or line[:1] == " "):
-                    name = line.split(" - ", 1)[1]
-                    progress.current_file = os.path.basename(name) or name
-                    progress.extract_current += 1
-            if progress is not None and progress.cancelled:
-                proc.terminate()
-                break
-        proc.wait(timeout=60)
+        with _DirCountPoller(dest, progress):
+            for line in proc.stderr:
+                stderr_chunks.append(line)
+                # 7z streams progress with embedded backspaces and CRs to
+                # repaint a TTY counter; strip those before parsing so the
+                # regex can find the "- relative/path" suffix.
+                cleaned = line.replace("\x08", "").replace("\r", "").strip()
+                if not cleaned:
+                    continue
+                if progress is not None:
+                    # Per-file lines (with -bb1) look like:
+                    #   "- relative/path/inside/archive"
+                    # Combined with progress (-bsp2) they may look like:
+                    #   "  3% 12      - relative/path"
+                    m = re.search(r"-\s+([^\s].*)$", cleaned)
+                    if m:
+                        name = m.group(1).strip()
+                        progress.current_file = os.path.basename(name) or name
+                        file_lines_seen += 1
+                        if file_lines_seen > progress.extract_current:
+                            progress.extract_current = file_lines_seen
+                if progress is not None and progress.cancelled:
+                    proc.terminate()
+                    break
+            proc.wait(timeout=60)
     except Exception:
         proc.kill()
         raise
@@ -505,7 +572,10 @@ def _extract_archive(
         )
     try:
         import patoolib
-        patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
+        # patoolib has no progress callback, so a directory-count poller is
+        # the only way to advance the dashboard during this step.
+        with _DirCountPoller(dest, progress):
+            patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
         _validate_extracted_paths(dest)
         return
     except ValueError:
