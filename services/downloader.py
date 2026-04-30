@@ -5,8 +5,10 @@ Pyrogram connects via MTProto directly (not the HTTP Bot API),
 so it can download files of any size using just the bot token —
 no user session string required.
 
-Files <= 20 MB are still fetched via the Bot API for speed.
-Larger files are streamed through the Pyrogram client.
+All files are downloaded via Pyrogram MTProto for maximum speed.
+MTProto is significantly faster than the Bot API HTTP endpoint
+because it uses persistent encrypted TCP connections with parallel
+chunk transfers.
 """
 
 from __future__ import annotations
@@ -28,6 +30,10 @@ _pyro_started: bool = False
 
 MIN_EDIT_INTERVAL = 1.0
 
+# Parallel chunk transfers — higher = faster on high-bandwidth servers.
+# Each transmission uses a separate TCP connection to Telegram DC.
+MAX_CONCURRENT_TRANSMISSIONS = 10
+
 
 async def _get_pyrogram() -> Client:
     """Return a started Pyrogram bot client (singleton)."""
@@ -40,11 +46,15 @@ async def _get_pyrogram() -> Client:
             bot_token=config.BOT_TOKEN,
             in_memory=True,
             no_updates=True,
+            max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
         )
     if not _pyro_started:
         await _pyro_client.start()
         _pyro_started = True
-        logger.info("Pyrogram download client started")
+        logger.info(
+            "Pyrogram download client started (concurrent_transmissions={})",
+            MAX_CONCURRENT_TRANSMISSIONS,
+        )
     return _pyro_client
 
 
@@ -65,8 +75,8 @@ async def download_file(
     """
     Download the document attached to *message* into *dest_path*.
 
-    Automatically chooses Bot API or Pyrogram depending on file size.
-    Updates *progress* for live UI feedback.
+    All downloads use Pyrogram MTProto for maximum speed —
+    parallel chunk transfers over persistent TCP connections.
 
     Returns:
         Absolute path to the downloaded file.
@@ -82,17 +92,12 @@ async def download_file(
     progress.phase = "downloading"
     progress.download_total = file_size
     progress.download_current = 0
+    progress.download_start = time.monotonic()
 
-    if file_size <= 20 * 1024 * 1024:
-        # Small file — plain Bot API download
-        logger.info("Small file ({} B), using Bot API download", file_size)
-        tg_file = await doc.get_file()
-        await tg_file.download_to_drive(out_path)
-        progress.download_current = file_size
-        return out_path
-
-    # Large file — Pyrogram MTProto download (no user session needed)
-    logger.info("Large file ({} B), using Pyrogram MTProto download", file_size)
+    logger.info(
+        "Downloading {} ({} B) via Pyrogram MTProto",
+        file_name, file_size,
+    )
     client = await _get_pyrogram()
 
     # Resolve the message in Pyrogram context
@@ -109,8 +114,12 @@ async def download_file(
         progress.download_total = total
         now = time.monotonic()
         if now - last_update >= MIN_EDIT_INTERVAL:
-            speed = current / max(now - start_ts, 0.001)
-            logger.debug("Download {}/{} ({:.1f} MB/s)", current, total, speed / 1e6)
+            elapsed = max(now - start_ts, 0.001)
+            speed = current / elapsed
+            logger.debug(
+                "Download {}/{} ({:.1f} MB/s)",
+                current, total, speed / 1e6,
+            )
             last_update = now
 
     path = await client.download_media(
@@ -121,6 +130,11 @@ async def download_file(
     if path is None:
         raise RuntimeError("Pyrogram returned no file")
 
+    elapsed = time.monotonic() - start_ts
+    speed_mbps = (file_size / max(elapsed, 0.001)) / 1e6
     progress.download_current = progress.download_total
-    logger.info("Download complete: {}", path)
+    logger.info(
+        "Download complete: {} ({:.1f} MB in {:.1f}s, {:.1f} MB/s)",
+        path, file_size / 1e6, elapsed, speed_mbps,
+    )
     return str(path)

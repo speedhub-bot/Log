@@ -374,12 +374,16 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                 pct = (
                     progress.download_current / max(progress.download_total, 1) * 100
                 )
-                speed = progress.download_current / max(elapsed, 0.001)
+                dl_elapsed = time.monotonic() - progress.download_start if progress.download_start else elapsed
+                speed = progress.download_current / max(dl_elapsed, 0.001)
+                remaining_bytes = max(progress.download_total - progress.download_current, 0)
+                eta = remaining_bytes / max(speed, 1)
                 text = (
                     f"\u2699\ufe0f Processing your archive...\n\n"
                     f"\U0001f4e5 Downloading: {progress_bar(progress.download_current, progress.download_total)} "
                     f"{pct:.0f}% ({bytes_human(progress.download_current)}/{bytes_human(progress.download_total)})\n"
                     f"\U0001f4c8 Speed: {bytes_human(int(speed))}/s\n"
+                    f"\u23f1 ETA: {seconds_human(eta)}\n"
                     f"\u23f1 Elapsed: {seconds_human(elapsed)}"
                 )
             elif progress.phase == "extracting":

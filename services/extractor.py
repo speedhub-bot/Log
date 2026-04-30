@@ -197,6 +197,7 @@ class ExtractionProgress:
     cookies_found: int = 0
     download_current: int = 0
     download_total: int = 0
+    download_start: float = 0.0     # monotonic timestamp when download began
     cancelled: bool = False
 
 
