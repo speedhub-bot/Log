@@ -56,24 +56,26 @@ class SmartCookieExtractor:
         Returns:
             List of cookie dictionaries
         """
-        results: List[Dict[str, str]] = []
         fp = Path(filepath)
-
         if not fp.exists():
             raise FileNotFoundError(f"File not found: {fp}")
-
         with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-            for _line_num, line in enumerate(f, 1):
-                line = line.strip()
+            return self.extract_from_text(f.read())
 
-                # Skip empty lines and comments
-                if not line or line.startswith("#"):
-                    continue
+    def extract_from_text(self, text: str) -> List[Dict[str, str]]:
+        """Extract cookies from a raw Netscape-format cookies string.
 
-                cookie = self.parse_cookie_line(line)
-                if cookie and self._matches_domain(cookie["domain"]):
-                    results.append(cookie)
-
+        Lets streaming code paths (e.g. in-memory decompressed zip
+        entries) reuse the same parser without writing to disk.
+        """
+        results: List[Dict[str, str]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            cookie = self.parse_cookie_line(line)
+            if cookie and self._matches_domain(cookie["domain"]):
+                results.append(cookie)
         return results
 
     def parse_cookie_line(self, line: str) -> Optional[Dict[str, str]]:
@@ -1034,6 +1036,135 @@ def _bundle_all_zips(
     return zip_paths
 
 
+def _run_extraction_zip_stream(
+    archive_path: str,
+    domain: str,
+    progress: ExtractionProgress,
+    output_dir: str,
+    start: float,
+) -> ExtractionResult:
+    """Fast path for plain zip archives: walk members in place, scan
+    each one in memory, write per-source .txt files + bundle into zip.
+
+    Saves the disk-space + wall-clock cost of first unpacking the whole
+    archive to a temp dir, matching u.txt's ``extractZipStreaming`` idea.
+    """
+    logger.info("Zip-streaming {} (no disk extraction)", archive_path)
+    progress.phase = "extracting"
+    progress.extract_start = time.monotonic()
+    progress.current_file = ""
+
+    per_source_dir = tempfile.mkdtemp(
+        dir=str(config.TEMP_DIR), prefix="cookie_out_",
+    )
+    safe_domain = re.sub(r"[^A-Za-z0-9._-]", "_", domain)
+    cookie_parser = SmartCookieExtractor(domain)
+
+    try:
+        try:
+            zf = zipfile.ZipFile(archive_path, "r")
+        except zipfile.BadZipFile as exc:
+            raise RuntimeError(f"Not a valid zip: {exc}") from exc
+
+        with zf:
+            members = [m for m in zf.infolist() if not m.is_dir()]
+            progress.extract_total = len(members)
+            progress.files_total = len(members)
+
+            # Switch to scanning phase straight away — we're doing
+            # extract+scan together, so there's no separate "extract
+            # to disk" step for the dashboard to render.
+            progress.phase = "scanning"
+            file_counter = 1
+
+            for member in members:
+                if progress.cancelled:
+                    break
+                progress.current_file = os.path.basename(member.filename) or member.filename
+                progress.extract_current += 1
+
+                # Hard cap per-entry size so a corrupt zip bomb can't
+                # OOM us. Cookie txts are small — 64 MiB is generous.
+                if member.file_size and member.file_size > 64 * 1024 * 1024:
+                    progress.files_scanned += 1
+                    continue
+
+                try:
+                    with zf.open(member, "r") as fh:
+                        raw = fh.read()
+                except (RuntimeError, zipfile.BadZipFile, OSError):
+                    # RuntimeError from zipfile means encrypted entry —
+                    # we already probed and ruled that out, but just in
+                    # case skip silently instead of aborting the job.
+                    progress.files_scanned += 1
+                    continue
+
+                try:
+                    text = raw.decode("utf-8", errors="ignore")
+                except Exception:
+                    progress.files_scanned += 1
+                    continue
+
+                try:
+                    cookies = cookie_parser.extract_from_text(text)
+                except Exception:
+                    cookies = []
+
+                if cookies:
+                    out_name = f"akaza_{safe_domain}_{file_counter}.txt"
+                    out_path = os.path.join(per_source_dir, out_name)
+                    try:
+                        with open(out_path, "w", encoding="utf-8") as fh2:
+                            for c in cookies:
+                                fh2.write(
+                                    f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
+                                    f"{c['secure']}\t{c['expiration']}\t"
+                                    f"{c['name']}\t{c['value']}\n"
+                                )
+                                progress.cookies_found += 1
+                        file_counter += 1
+                    except OSError:
+                        logger.exception(
+                            "Failed to write per-source file {}", out_path,
+                        )
+
+                progress.files_scanned += 1
+
+        progress.phase = "packaging"
+        progress.current_file = ""
+        output_files = _bundle_all_zips(per_source_dir, output_dir, domain)
+
+        output_files = [
+            p for p in output_files
+            if os.path.exists(p) and os.path.getsize(p) > 0
+        ]
+        duration = time.monotonic() - start
+
+        if progress.cancelled:
+            progress.phase = "cancelled"
+            return ExtractionResult(
+                success=bool(output_files),
+                output_files=output_files,
+                cookies_found=progress.cookies_found,
+                files_scanned=progress.files_scanned,
+                duration_seconds=duration,
+                partial=True,
+                error="" if output_files else "Cancelled by user (no cookies found yet)",
+            )
+
+        progress.phase = "done"
+        return ExtractionResult(
+            success=True,
+            output_files=output_files,
+            cookies_found=progress.cookies_found,
+            files_scanned=progress.files_scanned,
+            duration_seconds=duration,
+        )
+
+    finally:
+        shutil.rmtree(per_source_dir, ignore_errors=True)
+
+
 def _run_extraction(
     archive_path: str,
     domain: str,
@@ -1048,6 +1179,18 @@ def _run_extraction(
     output_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
 
     try:
+        # Fast path: plain (non-encrypted) zip → stream-decompress each
+        # entry in memory and scan as we go, avoiding a full disk
+        # extraction. Mirrors u.txt's extractZipStreaming pattern.
+        if (
+            password is None
+            and _sniff_archive_type(archive_path) == "zip"
+            and not _probe_encrypted_entries(archive_path)
+        ):
+            return _run_extraction_zip_stream(
+                archive_path, domain, progress, output_dir, start,
+            )
+
         # Phase 1: extract archive
         progress.phase = "extracting"
         progress.extract_start = time.monotonic()

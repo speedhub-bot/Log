@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -30,7 +31,7 @@ from telegram.ext import (
 
 import config
 from db import database as db
-from services.downloader import download_file
+from services.downloader import download_file, download_from_url
 from services.extractor import (
     ExtractionProgress,
     probe_encrypted_entries_async,
@@ -99,9 +100,11 @@ async def extract_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             await update.message.reply_text(text)  # type: ignore[union-attr]
         return ConversationHandler.END
 
-    # Rate limit check
+    is_admin = user.id == config.ADMIN_ID
+
+    # Rate limit check (admin bypasses)
     count = await db.count_user_extractions_last_hour(user.id)
-    if count >= config.MAX_EXTRACTIONS_PER_HOUR and user.id != config.ADMIN_ID:
+    if count >= config.MAX_EXTRACTIONS_PER_HOUR and not is_admin:
         text = (
             f"\u26a0\ufe0f Rate limit reached ({config.MAX_EXTRACTIONS_PER_HOUR}/hour).\n"
             "Please wait before starting another extraction."
@@ -147,13 +150,23 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     context.user_data["extract_domain"] = result  # type: ignore[index]
 
+    is_admin = user.id == config.ADMIN_ID
     remaining = await db.get_remaining_quota(user.id)
     vip = await db.is_vip(user.id)
-    limit_text = "Unlimited" if vip else bytes_human(remaining)
-    max_file = "10 GB" if vip else "2 GB"
+    if is_admin or vip:
+        limit_text = "Unlimited"
+    else:
+        limit_text = bytes_human(remaining)
+    if is_admin:
+        max_file = "Unlimited"
+    elif vip:
+        max_file = "10 GB"
+    else:
+        max_file = "2 GB"
 
     text = (
-        f"\U0001f4c1 Now send your archive file\n"
+        f"\U0001f4c1 Now send your archive file — OR paste a direct "
+        f"download URL (.zip / .rar).\n"
         f"Supported: .zip .rar .7z .tar.gz\n"
         f"Your limit: {limit_text} remaining today\n"
         f"Max file size: {max_file}"
@@ -183,39 +196,43 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return FILE
 
     file_size = doc.file_size or 0
+    is_admin = user.id == config.ADMIN_ID
     vip = await db.is_vip(user.id)
 
-    # Max file size check
-    max_bytes = config.VIP_MAX_FILE_BYTES if vip else config.FREE_MAX_FILE_BYTES
-    if file_size > max_bytes:
-        await update.message.reply_text(
-            f"\u274c File too large ({bytes_human(file_size)}).\n"
-            f"Max: {bytes_human(max_bytes)}\n\n"
-            "\U0001f451 Get VIP for higher limits!",
-            reply_markup=_cancel_kb(),
-        )
-        return FILE
+    # Max file size check (admin bypasses)
+    if not is_admin:
+        max_bytes = config.VIP_MAX_FILE_BYTES if vip else config.FREE_MAX_FILE_BYTES
+        if file_size > max_bytes:
+            await update.message.reply_text(
+                f"\u274c File too large ({bytes_human(file_size)}).\n"
+                f"Max: {bytes_human(max_bytes)}\n\n"
+                "\U0001f451 Get VIP for higher limits!",
+                reply_markup=_cancel_kb(),
+            )
+            return FILE
 
-    # Quota check
-    remaining = await db.get_remaining_quota(user.id)
-    if remaining != -1 and file_size > remaining:
-        await update.message.reply_text(
-            f"\u274c Daily quota exceeded!\n"
-            f"Used: {bytes_human(config.FREE_DAILY_LIMIT_BYTES - remaining)} / "
-            f"{bytes_human(config.FREE_DAILY_LIMIT_BYTES)}\n"
-            f"Resets in: {time_until((await db.get_user(user.id))['daily_reset_at'])}\n\n"  # type: ignore[index]
-            "\U0001f451 Get VIP for unlimited access!",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f451 Get VIP", callback_data="getvip")],
-                [InlineKeyboardButton("\u274c Cancel", callback_data="extract_cancel")],
-            ]),
-        )
-        return ConversationHandler.END
+    # Quota check (admin bypasses)
+    if not is_admin:
+        remaining = await db.get_remaining_quota(user.id)
+        if remaining != -1 and file_size > remaining:
+            await update.message.reply_text(
+                f"\u274c Daily quota exceeded!\n"
+                f"Used: {bytes_human(config.FREE_DAILY_LIMIT_BYTES - remaining)} / "
+                f"{bytes_human(config.FREE_DAILY_LIMIT_BYTES)}\n"
+                f"Resets in: {time_until((await db.get_user(user.id))['daily_reset_at'])}\n\n"  # type: ignore[index]
+                "\U0001f451 Get VIP for unlimited access!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f451 Get VIP", callback_data="getvip")],
+                    [InlineKeyboardButton("\u274c Cancel", callback_data="extract_cancel")],
+                ]),
+            )
+            return ConversationHandler.END
 
     domain = context.user_data.get("extract_domain", "unknown")  # type: ignore[union-attr]
 
-    # Consume quota
-    await db.consume_quota(user.id, file_size)
+    # Consume quota (no-op for admin)
+    if not is_admin:
+        await db.consume_quota(user.id, file_size)
 
     # Create DB job
     job_id = await db.create_job(user.id, domain, doc.file_name or "archive", file_size)
@@ -230,24 +247,95 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     progress = ExtractionProgress()
     _active_progress[job_id] = progress
 
+    source_ref = update.message  # Telegram document source
+
     async def _worker() -> None:
         await _process_job(
             update, context, job_id, user.id, domain,
-            update.message, progress_msg, progress,  # type: ignore[arg-type]
+            source_ref, progress_msg, progress,
         )
 
     # Enqueue
-    is_vip = await db.is_vip(user.id)
+    is_vip_flag = await db.is_vip(user.id)
     item = QueueItem(
-        priority=0 if is_vip else 1,
+        priority=0 if (is_vip_flag or is_admin) else 1,
         job_id=job_id,
         user_id=user.id,
-        is_vip=is_vip,
+        is_vip=is_vip_flag,
         coro_factory=_worker,
     )
     assert _job_queue is not None
     pos = await _job_queue.enqueue(item)
 
+    if pos > 0:
+        await progress_msg.edit_text(
+            f"\u23f3 You are #{pos + 1} in queue.\n"
+            f"Estimated wait: ~{pos * 4} minutes",
+            reply_markup=_cancel_job_kb(job_id),
+        )
+
+    return ConversationHandler.END
+
+
+_URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+
+
+async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Accept a direct download URL in the FILE state as an alternative
+    to uploading a document. The URL is downloaded by the queue worker;
+    we just enqueue the job here.
+    """
+    user = update.effective_user
+    if user is None or update.message is None:
+        return FILE
+
+    raw = (update.message.text or "").strip()
+    if not _URL_RE.match(raw):
+        await update.message.reply_text(
+            "\u274c That doesn't look like a direct URL.\n"
+            "Send an archive file or paste an http(s) link to a .zip/.rar.",
+            reply_markup=_cancel_kb(),
+        )
+        return FILE
+
+    # Basic extension sanity check (HEAD probe is done by the worker).
+    lower = raw.split("?", 1)[0].lower()
+    if not any(lower.endswith(ext) for ext in (".zip", ".rar", ".7z", ".tar.gz", ".tgz")):
+        # Not fatal — CDN redirects often have no extension. Just warn.
+        logger.info("URL has no archive extension, trusting server: {}", raw)
+
+    is_admin = user.id == config.ADMIN_ID
+    vip = await db.is_vip(user.id)
+    domain = context.user_data.get("extract_domain", "unknown")  # type: ignore[union-attr]
+
+    # Assume unknown size for URLs; the worker will enforce caps against
+    # the real content-length it sees during download.
+    file_name = raw.split("?")[0].rstrip("/").split("/")[-1] or "archive"
+    job_id = await db.create_job(user.id, domain, file_name, 0)
+
+    progress_msg = await update.message.reply_text(
+        "\u23f3 Queued for download...",
+        reply_markup=_cancel_job_kb(job_id),
+    )
+
+    progress = ExtractionProgress()
+    _active_progress[job_id] = progress
+
+    async def _worker() -> None:
+        await _process_job(
+            update, context, job_id, user.id, domain,
+            ("url", raw, file_name), progress_msg, progress,
+        )
+
+    item = QueueItem(
+        priority=0 if (vip or is_admin) else 1,
+        job_id=job_id,
+        user_id=user.id,
+        is_vip=vip,
+        coro_factory=_worker,
+    )
+    assert _job_queue is not None
+    pos = await _job_queue.enqueue(item)
     if pos > 0:
         await progress_msg.edit_text(
             f"\u23f3 You are #{pos + 1} in queue.\n"
@@ -281,8 +369,15 @@ async def _process_job(
             _progress_updater(progress_msg, job_id, progress)
         )
 
-        # Download
-        archive_path = await download_file(original_msg, temp_dir, progress)
+        # Download — either from a Telegram document (original_msg is the
+        # Message) or from a direct URL (tuple: ("url", url, name)).
+        if isinstance(original_msg, tuple) and original_msg and original_msg[0] == "url":
+            _, url_value, name_hint = original_msg
+            archive_path = await download_from_url(
+                url_value, temp_dir, progress, file_name_hint=name_hint,
+            )
+        else:
+            archive_path = await download_file(original_msg, temp_dir, progress)
 
         # Password-protected entry probe. If the archive contains
         # encrypted entries, ask the user for the password before we
@@ -738,6 +833,12 @@ def register(app, job_queue: JobQueue) -> None:
             ],
             FILE: [
                 MessageHandler(filters.Document.ALL, file_received),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & filters.Regex(
+                        r"^\s*https?://\S+\s*$"
+                    ),
+                    url_received,
+                ),
                 CallbackQueryHandler(cancel_extract, pattern="^extract_cancel$"),
             ],
         },
