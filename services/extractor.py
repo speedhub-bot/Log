@@ -529,18 +529,27 @@ def _extract_with_7z(
     if progress is not None and progress.cancelled:
         # Caller will short-circuit; don't raise.
         return
+
+    # Ground-truth the file count — see identical logic in
+    # _extract_with_unrar for the reasoning.
+    actual_count = 0
+    for _r, _d, files in os.walk(dest):
+        actual_count += len(files)
+    if progress is not None:
+        progress.extract_current = max(progress.extract_current, actual_count)
+
     if proc.returncode != 0:
         # If at least some files made it out, treat this as a partial success
         # rather than aborting the whole job. Common cause: a single
         # password-protected entry inside an otherwise-fine archive (e.g. a
         # bundled "KeyGen.rar" inside a log dump). We still want the cookies
         # from the 95% that extracted cleanly.
-        if progress is not None and progress.extract_current > 0:
+        if actual_count > 0:
             logger.warning(
-                "7z exited with code {} after extracting {} entries; "
+                "7z exited with code {} after extracting {} files; "
                 "treating as partial success. Last error output: {}",
                 proc.returncode,
-                progress.extract_current,
+                actual_count,
                 "".join(stderr_chunks[-5:]).strip()[:200],
             )
         else:
@@ -663,21 +672,41 @@ def _extract_with_unrar(
 
     if progress is not None and progress.cancelled:
         return
-    # unrar returns 0 on full success, 1 if it had warnings (e.g. a
-    # skipped password-protected entry — still a partial success for us),
-    # and higher codes for real errors.
+
+    # Ground-truth the extracted file count by walking the destination
+    # directory. _DirCountPoller may have missed the final state, and
+    # progress.extract_current can lag behind reality right after the
+    # process exits. This gives us an authoritative number to decide
+    # whether we got partial success.
+    actual_count = 0
+    for _r, _d, files in os.walk(dest):
+        actual_count += len(files)
+    if progress is not None:
+        progress.extract_current = max(progress.extract_current, actual_count)
+
+    # unrar exit codes:
+    #   0    success
+    #   1    non-fatal warning (still success for us)
+    #   3    corrupt header / CRC (can be partial)
+    #   10   nothing to extract (hard failure if count==0, partial otherwise)
+    #   11   wrong password — an archive-wide or per-entry password issue;
+    #        with -p- any encrypted entry triggers this. If other entries
+    #        extracted cleanly this is a partial success.
+    # Anything else we treat as a hard failure iff nothing was extracted.
     if proc.returncode not in (0, 1):
-        if progress is not None and progress.extract_current > 0:
+        if actual_count > 0:
             logger.warning(
-                "unrar exited with code {} after extracting {} entries; "
-                "treating as partial success. Last output: {}",
+                "unrar exited with code {} after extracting {} files; "
+                "treating as partial success (archive likely has "
+                "password-protected entries). Last output: {}",
                 proc.returncode,
-                progress.extract_current,
+                actual_count,
                 "".join(output_chunks[-5:]).strip()[:200],
             )
         else:
             raise RuntimeError(
-                f"unrar extraction failed: {''.join(output_chunks).strip()[:2000]}"
+                f"unrar extraction failed (exit {proc.returncode}): "
+                f"{''.join(output_chunks).strip()[:2000]}"
             )
     _validate_extracted_paths(dest)
 
