@@ -34,6 +34,7 @@ from db import database as db
 from services.downloader import download_file, download_from_url
 from services.extractor import (
     ExtractionProgress,
+    guess_archive_password_async,
     probe_encrypted_entries_async,
     run_extraction_async,
 )
@@ -530,6 +531,37 @@ async def _maybe_prompt_for_password(
     if not encrypted:
         return None
 
+    # --- Auto-guess before prompting the user ----------------------
+    # Most stealer-log dumps are locked with a common password (1234,
+    # the channel @handle, etc). Try the candidate list silently — if
+    # anything hits we extract with no user intervention.
+    try:
+        await progress_msg.edit_text(
+            "\U0001f510 Encrypted archive detected — "
+            "trying common passwords\u2026",
+            reply_markup=_cancel_job_kb(job_id),
+        )
+    except Exception:
+        pass
+
+    try:
+        guessed = await guess_archive_password_async(archive_path)
+    except Exception:
+        logger.exception("Password auto-guess crashed on {}", archive_path)
+        guessed = None
+
+    if guessed is not None:
+        try:
+            await progress_msg.edit_text(
+                f"\U0001f513 Password auto-detected: <code>{guessed}</code>\n"
+                "Extracting\u2026",
+                parse_mode="HTML",
+                reply_markup=_cancel_job_kb(job_id),
+            )
+        except Exception:
+            pass
+        return guessed
+
     # Show up to three sample names so the user knows what's locked.
     sample = ", ".join(encrypted[:3])
     if len(encrypted) > 3:
@@ -537,8 +569,9 @@ async def _maybe_prompt_for_password(
     text = (
         f"\U0001f510 This archive has {len(encrypted)} password-protected "
         f"file(s):\n<code>{sample}</code>\n\n"
-        "Reply with the archive password to extract everything, or tap "
-        "<b>Skip</b> to extract only the unencrypted files."
+        "I couldn't auto-guess the password. Reply with the archive "
+        "password to extract everything, or tap <b>Skip</b> to extract "
+        "only the unencrypted files."
     )
     try:
         await progress_msg.edit_text(

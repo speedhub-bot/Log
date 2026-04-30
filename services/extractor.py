@@ -339,6 +339,133 @@ def _probe_encrypted_entries(archive_path: str) -> List[str]:
     return encrypted
 
 
+_COMMON_PASSWORDS: List[str] = [
+    # Default lazy passwords — ordered by prevalence in stealer-log dumps.
+    "1234", "0000", "pass", "password", "123456", "12345",
+    "admin", "root", "logs", "log", "rar", "zip", "test",
+    "cookies", "archive", "akaza", "free", "vip",
+]
+
+
+def _password_candidates(archive_path: str) -> List[str]:
+    """Build the list of passwords to try for *archive_path*.
+
+    Combines:
+      * ``_COMMON_PASSWORDS`` (default stealer-dump passwords).
+      * Tokens derived from the filename: the full basename (with and
+        without extension), and splits on common separators.
+      * Any ``@TAG`` substrings in the filename (channel handles like
+        ``@HARMONYLOGS`` — dump authors frequently use these as passwords).
+    """
+    base = os.path.basename(archive_path)
+    stem = base
+    # Strip up to two extensions so ``foo.tar.gz`` becomes ``foo``.
+    for _ in range(2):
+        if "." in stem:
+            stem = stem.rsplit(".", 1)[0]
+
+    seen: "set[str]" = set()
+    out: List[str] = []
+
+    def _push(val: str) -> None:
+        val = val.strip()
+        if not val:
+            return
+        if val in seen:
+            return
+        seen.add(val)
+        out.append(val)
+
+    for pwd in _COMMON_PASSWORDS:
+        _push(pwd)
+
+    _push(stem)
+    _push(stem.lower())
+    _push(stem.upper())
+
+    # Channel-handle style: ``@Something`` tokens.
+    for m in re.findall(r"@[A-Za-z0-9_]+", base):
+        _push(m)            # with @
+        _push(m.lstrip("@"))
+
+    # Split on common separators.
+    for tok in re.split(r"[\s._\-#@()\[\]{}]+", stem):
+        _push(tok)
+        _push(tok.lower())
+
+    return out
+
+
+def _try_archive_password(archive_path: str, password: str) -> bool:
+    """Return True if *password* successfully decrypts *archive_path*.
+
+    Uses ``unrar t -p<pwd>`` for RAR (exit 0 = ok, 11 = wrong pwd) and
+    ``7z t -p<pwd>`` for the rest (exit 0 = ok, 2 = wrong pwd).
+
+    Pipes ``-y`` / stdin=DEVNULL so the tool never hangs prompting.
+    Gives each attempt 30s before giving up.
+    """
+    import shutil as _shutil
+
+    lower = archive_path.lower()
+
+    if lower.endswith(".rar"):
+        unrar = _shutil.which("unrar")
+        if unrar:
+            try:
+                rc = subprocess.run(
+                    [unrar, "t", f"-p{password}", "-y", "-inul", archive_path],
+                    capture_output=True, timeout=30,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                ).returncode
+                return rc == 0
+            except Exception:
+                return False
+
+    sz = _shutil.which("7z")
+    if sz:
+        try:
+            rc = subprocess.run(
+                [sz, "t", f"-p{password}", archive_path],
+                capture_output=True, timeout=30,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            ).returncode
+            return rc == 0
+        except Exception:
+            return False
+
+    return False
+
+
+def guess_archive_password(archive_path: str) -> Optional[str]:
+    """Try the password candidate list against *archive_path*.
+
+    Returns the first password that successfully tests, or ``None`` if
+    none of the candidates worked. Runs sequentially — candidate list
+    is short enough (~30 entries) that parallelism isn't worth the
+    extra fork overhead.
+    """
+    candidates = _password_candidates(archive_path)
+    logger.info(
+        "Trying {} candidate passwords for {}",
+        len(candidates), os.path.basename(archive_path),
+    )
+    for pwd in candidates:
+        if _try_archive_password(archive_path, pwd):
+            logger.info(
+                "Password auto-guess hit for {}: {!r}",
+                os.path.basename(archive_path), pwd,
+            )
+            return pwd
+    logger.info(
+        "Password auto-guess exhausted for {} ({} candidates tried)",
+        os.path.basename(archive_path), len(candidates),
+    )
+    return None
+
+
 def _is_split_archive(path: str) -> bool:
     """Detect split/multipart archive naming patterns."""
     base = os.path.basename(path).lower()
@@ -1316,3 +1443,8 @@ async def run_extraction_async(
 async def probe_encrypted_entries_async(archive_path: str) -> List[str]:
     """Async wrapper around ``_probe_encrypted_entries``."""
     return await asyncio.to_thread(_probe_encrypted_entries, archive_path)
+
+
+async def guess_archive_password_async(archive_path: str) -> Optional[str]:
+    """Async wrapper around :func:`guess_archive_password`."""
+    return await asyncio.to_thread(guess_archive_password, archive_path)

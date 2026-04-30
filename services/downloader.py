@@ -34,12 +34,28 @@ _pyro_started: bool = False
 MIN_EDIT_INTERVAL = 1.0
 
 # Parallel chunk transfers within a single download — higher = faster on
-# high-bandwidth servers. Pyrogram tops out around 50; bot-token sessions
-# typically saturate well below that, but 16 noticeably outperforms the
-# previous default of 10 on big files (>200 MB).
+# high-bandwidth servers. Pyrogram internally tops out at 50; bot-token
+# sessions usually saturate somewhere between 16 and 32.  Default 32
+# gives a meaningful win on big files (>500 MB) over the previous 16
+# without triggering server-side rate-limits on a bot connection.
 MAX_CONCURRENT_TRANSMISSIONS = int(
-    os.getenv("PYROGRAM_MAX_TRANSMISSIONS", "16")
+    os.getenv("PYROGRAM_MAX_TRANSMISSIONS", "32")
 )
+
+
+def _check_tgcrypto_loaded() -> None:
+    """Log whether TgCrypto (pyrogram's fast C MTProto crypto backend)
+    is actually available. Missing TgCrypto silently falls back to the
+    pure-Python implementation, which is typically **5-10x slower**.
+    """
+    try:
+        import tgcrypto  # noqa: F401
+        logger.info("tgcrypto loaded — MTProto crypto uses C backend")
+    except ImportError:
+        logger.warning(
+            "tgcrypto NOT found; downloads will use the slow pure-Python "
+            "crypto fallback. Install with: pip install tgcrypto"
+        )
 
 
 async def _get_pyrogram() -> Client:
@@ -56,6 +72,7 @@ async def _get_pyrogram() -> Client:
             max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
         )
     if not _pyro_started:
+        _check_tgcrypto_loaded()
         await _pyro_client.start()
         _pyro_started = True
         logger.info(
@@ -78,12 +95,19 @@ async def download_file(
     message: Message,
     dest_path: str,
     progress: ExtractionProgress,
+    max_retries: int = 3,
 ) -> str:
     """
     Download the document attached to *message* into *dest_path*.
 
-    All downloads use Pyrogram MTProto for maximum speed —
-    parallel chunk transfers over persistent TCP connections.
+    Uses pyrogram's MTProto transport with up to ``MAX_CONCURRENT_TRANSMISSIONS``
+    parallel chunk fetches and the tgcrypto C backend (if installed) for
+    AES-IGE. Also:
+      * Retries once on ``FloodWait`` after sleeping the server-requested
+        delay, up to *max_retries* total attempts.
+      * Tracks and logs **instantaneous**, **peak** and **average** MB/s.
+      * Updates the ExtractionProgress so the Telegram live dashboard
+        always reflects true bytes-in-flight.
 
     Returns:
         Absolute path to the downloaded file.
@@ -102,8 +126,9 @@ async def download_file(
     progress.download_start = time.monotonic()
 
     logger.info(
-        "Downloading {} ({} B) via Pyrogram MTProto",
-        file_name, file_size,
+        "Downloading {} ({:.1f} MB) via Pyrogram MTProto "
+        "(parallel_transmissions={})",
+        file_name, file_size / 1e6, MAX_CONCURRENT_TRANSMISSIONS,
     )
     client = await _get_pyrogram()
 
@@ -112,29 +137,69 @@ async def download_file(
     if not isinstance(pyro_msg, PyroMessage) or not pyro_msg.document:
         raise RuntimeError("Could not resolve file message via Pyrogram")
 
-    start_ts = time.monotonic()
-    last_update = start_ts
+    # Import lazily: pyrogram exceptions module location varies between
+    # 2.x minor versions. We degrade gracefully if the exact exception
+    # class isn't found.
+    try:
+        from pyrogram.errors import FloodWait
+    except ImportError:
+        FloodWait = None  # type: ignore[assignment]
 
-    def _progress_cb(current: int, total: int) -> None:
-        # Pyrogram calls this synchronously from its IO loop; keep it cheap.
-        nonlocal last_update
-        progress.download_current = current
-        progress.download_total = total
-        now = time.monotonic()
-        if now - last_update >= MIN_EDIT_INTERVAL:
-            elapsed = max(now - start_ts, 0.001)
-            speed = current / elapsed
-            logger.debug(
-                "Download {}/{} ({:.1f} MB/s)",
-                current, total, speed / 1e6,
+    attempt = 0
+    while True:
+        attempt += 1
+        start_ts = time.monotonic()
+        last_log = start_ts
+        last_bytes = 0
+        peak_mbps = 0.0
+
+        def _progress_cb(current: int, total: int) -> None:
+            nonlocal last_log, last_bytes, peak_mbps
+            progress.download_current = current
+            progress.download_total = total
+            now = time.monotonic()
+            if now - last_log >= MIN_EDIT_INTERVAL:
+                dt = max(now - last_log, 0.001)
+                # Instantaneous speed over the last second or so — the
+                # real "are we still moving" signal during flaky links.
+                inst_mbps = (current - last_bytes) / dt / 1e6
+                # Average since the download began — the one most users
+                # think of as "how fast was this download".
+                avg_elapsed = max(now - start_ts, 0.001)
+                avg_mbps = current / avg_elapsed / 1e6
+                if inst_mbps > peak_mbps:
+                    peak_mbps = inst_mbps
+                last_log = now
+                last_bytes = current
+                logger.info(
+                    "Download {}/{:,}B  {:.1f}% | "
+                    "inst={:.1f}MB/s avg={:.1f}MB/s peak={:.1f}MB/s",
+                    f"{current:,}", total,
+                    (current / total * 100) if total else 0,
+                    inst_mbps, avg_mbps, peak_mbps,
+                )
+
+        try:
+            path = await client.download_media(
+                message=pyro_msg,
+                file_name=out_path,
+                progress=_progress_cb,
             )
-            last_update = now
+            break
+        except Exception as exc:
+            # FloodWait: server asked us to back off — sleep and retry.
+            if FloodWait is not None and isinstance(exc, FloodWait):
+                wait = getattr(exc, "value", getattr(exc, "x", 5))
+                if attempt >= max_retries:
+                    raise
+                logger.warning(
+                    "FloodWait hit on attempt {}/{}; sleeping {}s",
+                    attempt, max_retries, wait,
+                )
+                await asyncio.sleep(float(wait))
+                continue
+            raise
 
-    path = await client.download_media(
-        message=pyro_msg,
-        file_name=out_path,
-        progress=_progress_cb,
-    )
     if path is None:
         raise RuntimeError("Pyrogram returned no file")
 
@@ -142,8 +207,9 @@ async def download_file(
     speed_mbps = (file_size / max(elapsed, 0.001)) / 1e6
     progress.download_current = progress.download_total
     logger.info(
-        "Download complete: {} ({:.1f} MB in {:.1f}s, {:.1f} MB/s)",
-        path, file_size / 1e6, elapsed, speed_mbps,
+        "Download complete: {} ({:.1f} MB in {:.1f}s, avg {:.1f} MB/s, "
+        "peak {:.1f} MB/s)",
+        path, file_size / 1e6, elapsed, speed_mbps, peak_mbps,
     )
     return str(path)
 
