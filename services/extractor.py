@@ -20,7 +20,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Generator, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from loguru import logger
 
@@ -975,36 +975,63 @@ def _ext_kind(lower_path: str) -> Optional[str]:
     return None
 
 
-def _write_output_chunks(
-    cookies: Generator[str, None, None],
+def _write_one_zip(
+    files: List[str],
+    output_dir: str,
+    domain: str,
+    part_idx: int,
+) -> str:
+    safe_domain = re.sub(r"[^A-Za-z0-9._-]", "_", domain)
+    if part_idx == 1:
+        zip_path = os.path.join(output_dir, f"{safe_domain}_cookies.zip")
+    else:
+        zip_path = os.path.join(output_dir, f"{safe_domain}_cookies_part{part_idx}.zip")
+    with zipfile.ZipFile(
+        zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+    ) as zf:
+        for src in files:
+            zf.write(src, arcname=os.path.basename(src))
+    return zip_path
+
+
+def _bundle_all_zips(
+    per_source_dir: str,
     output_dir: str,
     domain: str,
 ) -> List[str]:
-    """
-    Stream cookie lines into <=45 MB chunk files.
-    Returns list of output file paths.
-    """
-    chunk_idx = 1
-    current_size = 0
-    paths: List[str] = []
+    """Like ``_bundle_per_source_txts_into_zip`` but returns the full
+    list of zip files (one or many parts)."""
+    entries: List[tuple[str, int]] = []
+    for name in sorted(os.listdir(per_source_dir)):
+        path = os.path.join(per_source_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            continue
+        if sz > 0:
+            entries.append((path, sz))
 
-    def _open_chunk() -> "tuple[str, object]":
-        p = os.path.join(output_dir, f"{domain}_cookies_part{chunk_idx}.txt")
-        paths.append(p)
-        return p, open(p, "w", encoding="utf-8")
+    if not entries:
+        return []
 
-    path, fh = _open_chunk()
-    for line in cookies:
-        encoded = line.encode("utf-8")
-        if current_size + len(encoded) > config.OUTPUT_CHUNK_SIZE_BYTES and current_size > 0:
-            fh.close()  # type: ignore[union-attr]
-            chunk_idx += 1
-            current_size = 0
-            path, fh = _open_chunk()
-        fh.write(line)  # type: ignore[union-attr]
-        current_size += len(encoded)
-    fh.close()  # type: ignore[union-attr]
-    return paths
+    limit = max(int(getattr(config, "OUTPUT_CHUNK_SIZE_BYTES", 45 * 1024 * 1024)), 1024)
+    zip_paths: List[str] = []
+    part_idx = 1
+    batch: List[str] = []
+    batch_size = 0
+    for path, sz in entries:
+        if batch and batch_size + sz > limit:
+            zip_paths.append(_write_one_zip(batch, output_dir, domain, part_idx))
+            part_idx += 1
+            batch = []
+            batch_size = 0
+        batch.append(path)
+        batch_size += sz
+    if batch:
+        zip_paths.append(_write_one_zip(batch, output_dir, domain, part_idx))
+    return zip_paths
 
 
 def _run_extraction(
@@ -1037,7 +1064,10 @@ def _run_extraction(
                 partial=True,
             )
 
-        # Phase 2: scan files
+        # Phase 2: scan files. Mirrors the reference layout from
+        # `log to cookie.py`: one .txt per source file that yielded
+        # matching cookies, named ``akaza_{domain}_{counter}.txt`` and
+        # then all of them bundled into a single ``.zip``.
         progress.phase = "scanning"
         extractor = SmartCookieExtractor(domain)
 
@@ -1047,30 +1077,46 @@ def _run_extraction(
                 all_files.append(os.path.join(root, fname))
         progress.files_total = len(all_files)
 
-        def _cookie_generator() -> Generator[str, None, None]:
-            for fpath in all_files:
-                if progress.cancelled:
-                    # Stop the generator cleanly so any cookies already
-                    # written to the current chunk file are flushed by
-                    # _write_output_chunks' final fh.close().
-                    return
-                progress.current_file = os.path.basename(fpath)
+        per_source_dir = tempfile.mkdtemp(
+            dir=str(config.TEMP_DIR), prefix="cookie_out_"
+        )
+        safe_domain = re.sub(r"[^A-Za-z0-9._-]", "_", domain)
+        file_counter = 1
+
+        for fpath in all_files:
+            if progress.cancelled:
+                break
+            progress.current_file = os.path.basename(fpath)
+            try:
+                cookies = extractor.extract_from_file(fpath)
+            except Exception:
+                cookies = []
+            if cookies:
+                out_name = f"akaza_{safe_domain}_{file_counter}.txt"
+                out_path = os.path.join(per_source_dir, out_name)
                 try:
-                    cookies = extractor.extract_from_file(fpath)
-                    for c in cookies:
-                        yield (
-                            f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
-                            f"{c['secure']}\t{c['expiration']}\t"
-                            f"{c['name']}\t{c['value']}\n"
-                        )
-                        progress.cookies_found += 1
-                except Exception:
-                    pass
-                progress.files_scanned += 1
+                    with open(out_path, "w", encoding="utf-8") as fh:
+                        for c in cookies:
+                            fh.write(
+                                f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
+                                f"{c['secure']}\t{c['expiration']}\t"
+                                f"{c['name']}\t{c['value']}\n"
+                            )
+                            progress.cookies_found += 1
+                    file_counter += 1
+                except OSError:
+                    logger.exception("Failed to write per-source file {}", out_path)
+            progress.files_scanned += 1
 
-        output_files = _write_output_chunks(_cookie_generator(), output_dir, domain)
+        # Phase 3: bundle all per-source .txt files into a .zip.
+        progress.phase = "packaging"
+        progress.current_file = ""
+        output_files = _bundle_all_zips(per_source_dir, output_dir, domain)
 
-        # Drop empty chunk files (e.g. cancelled before any cookie was found).
+        # The per-source temp dir is no longer needed once zipped.
+        shutil.rmtree(per_source_dir, ignore_errors=True)
+
+        # Drop empty zip files (shouldn't happen, but belt-and-braces).
         output_files = [
             p for p in output_files
             if os.path.exists(p) and os.path.getsize(p) > 0

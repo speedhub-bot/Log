@@ -642,6 +642,17 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                     f"\u26a1 Rate: {rate:.1f} files/s   ETA: {seconds_human(eta)}\n"
                     f"\u23f1 Elapsed: {seconds_human(elapsed)}"
                 )
+            elif progress.phase == "packaging":
+                text = (
+                    f"\u2699\ufe0f Live Dashboard\n"
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    f"\U0001f4e5 Download:  Done \u2705\n"
+                    f"\U0001f4c2 Extract:   Done \u2705\n"
+                    f"\U0001f50d Scan:      Done \u2705\n"
+                    f"\U0001f4e6 Packaging cookies into .zip\u2026\n"
+                    f"\U0001f36a Cookies found: {progress.cookies_found:,}\n"
+                    f"\u23f1 Elapsed: {seconds_human(elapsed)}"
+                )
             else:
                 continue
 
