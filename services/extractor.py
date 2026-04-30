@@ -253,6 +253,16 @@ def _is_split_archive(path: str) -> bool:
     return False
 
 
+def _validate_extracted_paths(dest: str) -> None:
+    """Post-extraction check: ensure no file escaped the destination directory."""
+    dest_real = os.path.realpath(dest)
+    for root, dirs, files in os.walk(dest):
+        for name in files + dirs:
+            full = os.path.realpath(os.path.join(root, name))
+            if not full.startswith(dest_real + os.sep) and full != dest_real:
+                raise ValueError(f"Path traversal detected after extraction: {name}")
+
+
 def _extract_with_7z(archive_path: str, dest: str) -> None:
     """Extract using 7z command-line tool (handles split archives, damaged files, etc.)."""
     import shutil as _shutil
@@ -270,6 +280,7 @@ def _extract_with_7z(archive_path: str, dest: str) -> None:
     )
     if result.returncode != 0:
         raise RuntimeError(f"7z extraction failed: {result.stderr.strip()}")
+    _validate_extracted_paths(dest)
 
 
 def _extract_archive(archive_path: str, dest: str) -> None:
@@ -295,7 +306,7 @@ def _extract_archive(archive_path: str, dest: str) -> None:
             with zipfile.ZipFile(archive_path, "r") as zf:
                 _safe_zip_extract(zf, dest)
             return
-        except (zipfile.BadZipFile, Exception) as exc:
+        except (zipfile.BadZipFile, OSError) as exc:
             logger.warning("zipfile failed ({}), falling back to 7z", exc)
             _extract_with_7z(archive_path, dest)
             return
@@ -306,7 +317,7 @@ def _extract_archive(archive_path: str, dest: str) -> None:
             with tarfile.open(archive_path, "r:*") as tf:
                 _safe_tar_extract(tf, dest)
             return
-        except (tarfile.TarError, Exception) as exc:
+        except (tarfile.TarError, OSError) as exc:
             logger.warning("tarfile failed ({}), falling back to 7z", exc)
             _extract_with_7z(archive_path, dest)
             return
@@ -327,6 +338,8 @@ def _extract_archive(archive_path: str, dest: str) -> None:
         import patoolib
         patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
     except Exception as exc:
+        if isinstance(exc, ValueError):
+            raise
         logger.warning("patoolib failed ({}), falling back to 7z", exc)
         _extract_with_7z(archive_path, dest)
 
