@@ -25,7 +25,7 @@ from db import database as db
 from handlers import admin as admin_handlers
 from handlers import extract as extract_handlers
 from handlers import user as user_handlers
-from services.downloader import disconnect_telethon
+from services.downloader import disconnect_pyrogram
 from services.queue import JobQueue
 
 # ── Logging ─────────────────────────────────────────────────
@@ -229,7 +229,7 @@ def main() -> None:
     async def post_shutdown(application) -> None:
         await job_queue.stop()
         scheduler.shutdown(wait=False)
-        await disconnect_telethon()
+        await disconnect_pyrogram()
         await db.close_db()
         logger.info("Shutdown complete")
 

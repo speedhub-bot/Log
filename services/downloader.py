@@ -1,58 +1,60 @@
 """
-Large-file downloader using Telethon user client.
+Large-file downloader using Pyrogram MTProto client.
 
-Files <= 20 MB are fetched via the Bot API (``bot.get_file``).
-Larger files are streamed through a Telethon ``TelegramClient``
-connected via a pre-generated session string.
+Pyrogram connects via MTProto directly (not the HTTP Bot API),
+so it can download files of any size using just the bot token —
+no user session string required.
+
+Files <= 20 MB are still fetched via the Bot API for speed.
+Larger files are streamed through the Pyrogram client.
 """
 
 from __future__ import annotations
 
 import os
 import time
-from typing import Optional
 
 from loguru import logger
+from pyrogram import Client
+from pyrogram.types import Message as PyroMessage
 from telegram import Document, Message
 
 import config
 from services.extractor import ExtractionProgress
 
-# Lazy-initialised Telethon client
-_telethon_client = None
-_telethon_started = False
+# Lazy-initialised Pyrogram client
+_pyro_client: Client | None = None
+_pyro_started: bool = False
+
+MIN_EDIT_INTERVAL = 1.0
 
 
-async def _get_telethon():
-    """Return a started Telethon client (singleton)."""
-    global _telethon_client, _telethon_started
-    if not config.SESSION_STRING:
-        raise RuntimeError(
-            "SESSION_STRING is not configured. "
-            "Large file downloads (>20 MB) require a Telethon session string. "
-            "See README for generation instructions."
+async def _get_pyrogram() -> Client:
+    """Return a started Pyrogram bot client (singleton)."""
+    global _pyro_client, _pyro_started
+    if _pyro_client is None:
+        _pyro_client = Client(
+            name="cookie_downloader",
+            api_id=config.API_ID,
+            api_hash=config.API_HASH,
+            bot_token=config.BOT_TOKEN,
+            in_memory=True,
+            no_updates=True,
         )
-    if _telethon_client is None:
-        from telethon import TelegramClient
-        from telethon.sessions import StringSession
-
-        _telethon_client = TelegramClient(
-            StringSession(config.SESSION_STRING),
-            config.API_ID,
-            config.API_HASH,
-        )
-    if not _telethon_started:
-        await _telethon_client.start()
-        _telethon_started = True
-    return _telethon_client
+    if not _pyro_started:
+        await _pyro_client.start()
+        _pyro_started = True
+        logger.info("Pyrogram download client started")
+    return _pyro_client
 
 
-async def disconnect_telethon() -> None:
-    """Gracefully disconnect the Telethon client."""
-    global _telethon_started
-    if _telethon_client is not None and _telethon_started:
-        await _telethon_client.disconnect()
-        _telethon_started = False
+async def disconnect_pyrogram() -> None:
+    """Gracefully disconnect the Pyrogram client."""
+    global _pyro_started
+    if _pyro_client is not None and _pyro_started:
+        await _pyro_client.stop()
+        _pyro_started = False
+        logger.info("Pyrogram download client stopped")
 
 
 async def download_file(
@@ -63,13 +65,13 @@ async def download_file(
     """
     Download the document attached to *message* into *dest_path*.
 
-    Automatically chooses Bot API or Telethon depending on file size.
+    Automatically chooses Bot API or Pyrogram depending on file size.
     Updates *progress* for live UI feedback.
 
     Returns:
         Absolute path to the downloaded file.
     """
-    doc: Optional[Document] = message.document
+    doc: Document | None = message.document
     if doc is None:
         raise ValueError("Message has no document attached")
 
@@ -89,38 +91,36 @@ async def download_file(
         progress.download_current = file_size
         return out_path
 
-    # Large file — Telethon user-client streaming download
-    logger.info("Large file ({} B), using Telethon download", file_size)
-    client = await _get_telethon()
+    # Large file — Pyrogram MTProto download (no user session needed)
+    logger.info("Large file ({} B), using Pyrogram MTProto download", file_size)
+    client = await _get_pyrogram()
 
-    # Resolve the Telegram message in the Telethon context
-    tl_message = await client.get_messages(
-        message.chat_id,
-        ids=message.message_id,
-    )
-    if tl_message is None:
-        raise RuntimeError("Could not resolve message via Telethon")
+    # Resolve the message in Pyrogram context
+    pyro_msg = await client.get_messages(message.chat_id, message.message_id)
+    if not isinstance(pyro_msg, PyroMessage) or not pyro_msg.document:
+        raise RuntimeError("Could not resolve file message via Pyrogram")
 
-    last_update = time.monotonic()
-    downloaded = 0
+    start_ts = time.monotonic()
+    last_update = start_ts
 
     async def _progress_cb(current: int, total: int) -> None:
-        nonlocal last_update, downloaded
-        downloaded = current
+        nonlocal last_update
         progress.download_current = current
         progress.download_total = total
         now = time.monotonic()
-        if now - last_update >= 1.0:
+        if now - last_update >= MIN_EDIT_INTERVAL:
             speed = current / max(now - start_ts, 0.001)
             logger.debug("Download {}/{} ({:.1f} MB/s)", current, total, speed / 1e6)
             last_update = now
 
-    start_ts = time.monotonic()
-    await client.download_media(
-        tl_message,
-        file=out_path,
-        progress_callback=_progress_cb,
+    path = await client.download_media(
+        message=pyro_msg,
+        file_name=out_path,
+        progress=_progress_cb,
     )
+    if path is None:
+        raise RuntimeError("Pyrogram returned no file")
+
     progress.download_current = progress.download_total
-    logger.info("Download complete: {}", out_path)
-    return out_path
+    logger.info("Download complete: {}", path)
+    return str(path)
