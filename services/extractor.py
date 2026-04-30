@@ -254,6 +254,40 @@ def _is_split_archive(path: str) -> bool:
     return False
 
 
+# Magic-byte signatures used to detect the *actual* archive format,
+# regardless of the filename extension the user sent.
+_MAGIC_SIGNATURES: List[tuple[bytes, str]] = [
+    (b"PK\x03\x04", "zip"),         # standard zip
+    (b"PK\x05\x06", "zip"),         # empty zip (EOCD only)
+    (b"PK\x07\x08", "zip"),         # spanned zip data descriptor
+    (b"Rar!\x1a\x07\x00", "rar"),   # RAR 1.5+
+    (b"Rar!\x1a\x07\x01\x00", "rar"),  # RAR 5.0
+    (b"7z\xbc\xaf\x27\x1c", "7z"),  # 7z
+    (b"\x1f\x8b", "gz"),            # gzip / .tar.gz
+    (b"BZh", "bz2"),                # bzip2 / .tar.bz2
+    (b"\xfd7zXZ\x00", "xz"),        # xz / .tar.xz
+]
+
+
+def _sniff_archive_type(path: str) -> Optional[str]:
+    """Return a normalised archive-type tag based on file magic bytes.
+
+    Returns one of: "zip", "rar", "7z", "gz", "bz2", "xz", or None
+    if the file is empty / unreadable / unrecognised.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+    if not head:
+        return None
+    for sig, kind in _MAGIC_SIGNATURES:
+        if head.startswith(sig):
+            return kind
+    return None
+
+
 def _validate_extracted_paths(dest: str) -> None:
     """Post-extraction check: ensure no file escaped the destination directory."""
     dest_real = os.path.realpath(dest)
@@ -288,12 +322,21 @@ def _extract_archive(archive_path: str, dest: str) -> None:
     """Extract an archive into *dest* using the best available tool.
 
     Strategy:
-    1. Split/multipart archives → 7z directly (Python can't handle these)
-    2. Regular .zip → try zipfile, fall back to 7z
-    3. Regular .tar.gz/.tgz/.tar.bz2 → try tarfile, fall back to 7z
-    4. .rar / .7z / other → try patoolib, fall back to 7z
+    1. Split/multipart archives → 7z directly.
+    2. Detect the *actual* archive format from magic bytes (so a file
+       mis-named with the wrong extension still works).
+    3. Try the cheapest pure-Python handler first (zipfile / tarfile),
+       fall through to patoolib for .rar, and finally fall back to 7z
+       for anything that didn't extract cleanly.
+    Path-traversal protection (ValueError) is never swallowed.
     """
-    lower = archive_path.lower()
+    if not os.path.exists(archive_path):
+        raise RuntimeError(f"Archive not found: {archive_path}")
+    if os.path.getsize(archive_path) == 0:
+        raise RuntimeError(
+            "Uploaded file is empty (0 bytes). "
+            "Please re-upload a valid archive."
+        )
 
     # Split archives — go straight to 7z
     if _is_split_archive(archive_path):
@@ -301,29 +344,57 @@ def _extract_archive(archive_path: str, dest: str) -> None:
         _extract_with_7z(archive_path, dest)
         return
 
-    # Regular .zip
-    if lower.endswith(".zip"):
+    # Determine the real archive format from the file's magic bytes; if
+    # that's inconclusive, fall back to the filename extension. This
+    # prevents e.g. a 7z file mis-named as .zip from killing the job
+    # with "File is not a zip file".
+    sniffed = _sniff_archive_type(archive_path)
+    lower = archive_path.lower()
+    if sniffed is None:
+        if lower.endswith(".zip"):
+            sniffed = "zip"
+        elif lower.endswith((".tar.gz", ".tgz")):
+            sniffed = "gz"
+        elif lower.endswith(".tar.bz2"):
+            sniffed = "bz2"
+        elif lower.endswith(".rar"):
+            sniffed = "rar"
+        elif lower.endswith(".7z"):
+            sniffed = "7z"
+
+    if sniffed != _ext_kind(lower):
+        logger.info(
+            "Archive content ({}) differs from extension ({}); routing by content",
+            sniffed, _ext_kind(lower),
+        )
+
+    # Pure-Python zip
+    if sniffed == "zip":
         try:
             with zipfile.ZipFile(archive_path, "r") as zf:
                 _safe_zip_extract(zf, dest)
             return
-        except (zipfile.BadZipFile, OSError) as exc:
+        except ValueError:
+            raise
+        except Exception as exc:
             logger.warning("zipfile failed ({}), falling back to 7z", exc)
             _extract_with_7z(archive_path, dest)
             return
 
-    # Tarballs
-    if lower.endswith((".tar.gz", ".tgz", ".tar.bz2")):
+    # Pure-Python tarball (gzip / bzip2 / xz / plain tar)
+    if sniffed in ("gz", "bz2", "xz"):
         try:
             with tarfile.open(archive_path, "r:*") as tf:
                 _safe_tar_extract(tf, dest)
             return
-        except (tarfile.TarError, OSError) as exc:
+        except ValueError:
+            raise
+        except Exception as exc:
             logger.warning("tarfile failed ({}), falling back to 7z", exc)
             _extract_with_7z(archive_path, dest)
             return
 
-    # .rar / .7z / other — try patoolib first, then 7z
+    # .rar / .7z / unknown — try patoolib first, then 7z
     import shutil as _shutil
 
     has_tool = (
@@ -338,11 +409,28 @@ def _extract_archive(archive_path: str, dest: str) -> None:
     try:
         import patoolib
         patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
+        _validate_extracted_paths(dest)
+        return
+    except ValueError:
+        raise
     except Exception as exc:
-        if isinstance(exc, ValueError):
-            raise
         logger.warning("patoolib failed ({}), falling back to 7z", exc)
         _extract_with_7z(archive_path, dest)
+
+
+def _ext_kind(lower_path: str) -> Optional[str]:
+    """Return the archive-kind tag implied by a (lowercased) filename."""
+    if lower_path.endswith(".zip"):
+        return "zip"
+    if lower_path.endswith((".tar.gz", ".tgz")):
+        return "gz"
+    if lower_path.endswith(".tar.bz2"):
+        return "bz2"
+    if lower_path.endswith(".rar"):
+        return "rar"
+    if lower_path.endswith(".7z"):
+        return "7z"
+    return None
 
 
 def _write_output_chunks(
