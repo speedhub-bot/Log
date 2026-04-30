@@ -16,6 +16,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -401,11 +402,17 @@ def _extract_with_7z(
         )
 
     # First, count entries so we can show a real progress bar.
+    # stdin=DEVNULL + start_new_session=True for the listing step too:
+    # archives with encrypted headers (``-mhe=on``) require the password
+    # to even read the file list, and 7z would otherwise hang prompting
+    # before extraction even begins.
     if progress is not None:
         try:
             count_proc = subprocess.run(
                 [sz, "l", "-slt", archive_path],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, timeout=60,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
             if count_proc.returncode == 0:
                 # "Path =" lines, minus the archive header line.
@@ -427,11 +434,14 @@ def _extract_with_7z(
     # We capture stderr below and parse per-file progress lines from it.
     # A directory-count poller runs alongside as a robust fallback so the
     # dashboard advances even if 7z's progress output format changes.
-    # stdin=DEVNULL is critical: if the archive contains a password-protected
-    # entry, 7z will otherwise prompt on stdin and hang indefinitely (there's
-    # no TTY attached when running under screen/nohup). DEVNULL gives 7z an
-    # immediate EOF, which makes it fail that file with a non-zero exit code
-    # rather than blocking forever.
+    # stdin=DEVNULL + start_new_session=True together neutralise every way
+    # 7z could otherwise hang on a password prompt:
+    #   * stdin=DEVNULL gives 7z immediate EOF when it tries to read input.
+    #   * start_new_session=True puts 7z in its own process group with no
+    #     controlling terminal, so even if it tries to open /dev/tty
+    #     directly to bypass stdin (some builds do that), the open fails.
+    # Combined effect: 7z fails any password-protected entry with a
+    # non-zero exit code rather than blocking forever.
     proc = subprocess.Popen(
         [sz, "x", archive_path, f"-o{dest}", "-y",
          "-bb1", "-bso2", "-bse2", "-bsp2"],
@@ -440,9 +450,48 @@ def _extract_with_7z(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     stderr_chunks: List[str] = []
     file_lines_seen = 0
+    # Watchdog: if neither the line parser nor the directory poller
+    # advance progress for this many seconds, assume the underlying tool
+    # is wedged and kill it. Picked generously so big-file decompression
+    # still finishes naturally.
+    WATCHDOG_IDLE_SECONDS = 180.0
+    last_progress_count = 0
+    last_progress_time = time.monotonic()
+    stop_watchdog = threading.Event()
+
+    def _watchdog() -> None:
+        nonlocal last_progress_count, last_progress_time
+        while not stop_watchdog.wait(5.0):
+            if proc.poll() is not None:
+                return
+            current = (
+                progress.extract_current
+                if progress is not None
+                else file_lines_seen
+            )
+            if current > last_progress_count:
+                last_progress_count = current
+                last_progress_time = time.monotonic()
+                continue
+            if time.monotonic() - last_progress_time > WATCHDOG_IDLE_SECONDS:
+                logger.error(
+                    "7z made no progress for {}s (stuck at {} entries); "
+                    "terminating.",
+                    int(WATCHDOG_IDLE_SECONDS), current,
+                )
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
+
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
+
     try:
         assert proc.stderr is not None
         with _DirCountPoller(dest, progress):
@@ -473,6 +522,9 @@ def _extract_with_7z(
     except Exception:
         proc.kill()
         raise
+    finally:
+        stop_watchdog.set()
+        watchdog_thread.join(timeout=2.0)
 
     if progress is not None and progress.cancelled:
         # Caller will short-circuit; don't raise.
@@ -578,7 +630,14 @@ def _extract_archive(
             _extract_with_7z(archive_path, dest, progress)
             return
 
-    # .rar / .7z / unknown — try patoolib first, then 7z
+    # .rar / .7z / unknown.
+    #
+    # Always try ``_extract_with_7z`` first: it gives us live per-file
+    # progress, runs with stdin=DEVNULL + start_new_session so it can't hang
+    # on a password prompt, and is watchdog-protected. patoolib (which shells
+    # out to ``unar`` by default) has neither progress nor protection from
+    # those hangs, and is only useful as a last resort if 7z truly can't
+    # open the archive at all.
     import shutil as _shutil
 
     has_tool = (
@@ -590,19 +649,35 @@ def _extract_archive(
             "Install p7zip-full on the server: "
             "apt-get install -y p7zip-full"
         )
+
     try:
-        import patoolib
-        # patoolib has no progress callback, so a directory-count poller is
-        # the only way to advance the dashboard during this step.
-        with _DirCountPoller(dest, progress):
-            patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
-        _validate_extracted_paths(dest)
+        _extract_with_7z(archive_path, dest, progress)
         return
     except ValueError:
         raise
     except Exception as exc:
-        logger.warning("patoolib failed ({}), falling back to 7z", exc)
-        _extract_with_7z(archive_path, dest, progress)
+        # Only fall back to patoolib if 7z couldn't extract a single entry.
+        # If 7z managed to extract anything, _extract_with_7z would have
+        # returned successfully via the partial-success path instead of
+        # raising, so reaching here means the archive is genuinely
+        # unreadable by 7z.
+        logger.warning("7z extraction failed ({}), trying patoolib as last resort", exc)
+        try:
+            import patoolib
+            # patoolib has no progress callback or stdin control, so the
+            # directory-count poller is the only way to advance the
+            # dashboard during this step.
+            with _DirCountPoller(dest, progress):
+                patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
+            _validate_extracted_paths(dest)
+            return
+        except ValueError:
+            raise
+        except Exception as exc2:
+            raise RuntimeError(
+                f"Both 7z and patoolib failed to extract the archive. "
+                f"7z: {exc}; patoolib: {exc2}"
+            ) from exc2
 
 
 def _ext_kind(lower_path: str) -> Optional[str]:
