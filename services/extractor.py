@@ -458,7 +458,7 @@ def _extract_with_7z(
     # advance progress for this many seconds, assume the underlying tool
     # is wedged and kill it. Picked generously so big-file decompression
     # still finishes naturally.
-    WATCHDOG_IDLE_SECONDS = 180.0
+    WATCHDOG_IDLE_SECONDS = 90.0
     last_progress_count = 0
     last_progress_time = time.monotonic()
     stop_watchdog = threading.Event()
@@ -545,7 +545,139 @@ def _extract_with_7z(
             )
         else:
             raise RuntimeError(
-                f"7z extraction failed: {''.join(stderr_chunks).strip()[:500]}"
+                f"7z extraction failed: {''.join(stderr_chunks).strip()[:2000]}"
+            )
+    _validate_extracted_paths(dest)
+
+
+def _extract_with_unrar(
+    archive_path: str,
+    dest: str,
+    progress: Optional["ExtractionProgress"] = None,
+) -> None:
+    """Extract a .rar archive with the proprietary ``unrar`` binary.
+
+    unrar is RARLab's reference implementation and is the only free tool
+    that correctly handles RAR5 format plus per-entry password protection.
+    We pass ``-p-`` to make it skip password-protected entries silently
+    instead of prompting, and ``-o+`` to overwrite any conflicts.
+
+    A ``_DirCountPoller`` advances the dashboard (unrar doesn't stream
+    per-file progress in a structured format), and the same watchdog
+    pattern as 7z guards against hangs.
+    """
+    import shutil as _shutil
+
+    unrar = _shutil.which("unrar")
+    if not unrar:
+        raise RuntimeError("unrar not found")
+
+    # Count entries first for the progress bar.
+    if progress is not None:
+        try:
+            count_proc = subprocess.run(
+                [unrar, "lb", "-p-", archive_path],
+                capture_output=True, text=True, timeout=60,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            if count_proc.returncode == 0:
+                lines = [
+                    ln for ln in count_proc.stdout.splitlines() if ln.strip()
+                ]
+                progress.extract_total = len(lines)
+                progress.extract_current = 0
+        except Exception as exc:
+            logger.debug(
+                "unrar list failed ({}); progress count unavailable", exc
+            )
+
+    # ``x``    extract with full paths
+    # ``-p-``  never ask for password; skip encrypted entries with error
+    # ``-o+``  overwrite existing files without prompting
+    # ``-y``   yes to all queries
+    # ``-idq`` quiet mode (reduce noise)
+    proc = subprocess.Popen(
+        [unrar, "x", "-p-", "-o+", "-y", archive_path, dest + os.sep],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    output_chunks: List[str] = []
+    WATCHDOG_IDLE_SECONDS = 90.0
+    last_progress_count = 0
+    last_progress_time = time.monotonic()
+    stop_watchdog = threading.Event()
+
+    def _watchdog() -> None:
+        nonlocal last_progress_count, last_progress_time
+        while not stop_watchdog.wait(5.0):
+            if proc.poll() is not None:
+                return
+            current = progress.extract_current if progress is not None else 0
+            if current > last_progress_count:
+                last_progress_count = current
+                last_progress_time = time.monotonic()
+                continue
+            if time.monotonic() - last_progress_time > WATCHDOG_IDLE_SECONDS:
+                logger.error(
+                    "unrar made no progress for {}s (stuck at {} entries); "
+                    "terminating.",
+                    int(WATCHDOG_IDLE_SECONDS), current,
+                )
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
+
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
+
+    try:
+        assert proc.stdout is not None
+        with _DirCountPoller(dest, progress):
+            for line in proc.stdout:
+                output_chunks.append(line)
+                cleaned = line.strip()
+                if not cleaned:
+                    continue
+                # unrar emits lines like "Extracting  dir/file.txt"
+                m = re.match(r"Extracting\s+(.+?)(?:\s+OK\s*)?$", cleaned)
+                if m and progress is not None:
+                    name = m.group(1).strip()
+                    progress.current_file = os.path.basename(name) or name
+                if progress is not None and progress.cancelled:
+                    proc.terminate()
+                    break
+            proc.wait(timeout=60)
+    except Exception:
+        proc.kill()
+        raise
+    finally:
+        stop_watchdog.set()
+        watchdog_thread.join(timeout=2.0)
+
+    if progress is not None and progress.cancelled:
+        return
+    # unrar returns 0 on full success, 1 if it had warnings (e.g. a
+    # skipped password-protected entry — still a partial success for us),
+    # and higher codes for real errors.
+    if proc.returncode not in (0, 1):
+        if progress is not None and progress.extract_current > 0:
+            logger.warning(
+                "unrar exited with code {} after extracting {} entries; "
+                "treating as partial success. Last output: {}",
+                proc.returncode,
+                progress.extract_current,
+                "".join(output_chunks[-5:]).strip()[:200],
+            )
+        else:
+            raise RuntimeError(
+                f"unrar extraction failed: {''.join(output_chunks).strip()[:2000]}"
             )
     _validate_extracted_paths(dest)
 
@@ -632,12 +764,17 @@ def _extract_archive(
 
     # .rar / .7z / unknown.
     #
-    # Always try ``_extract_with_7z`` first: it gives us live per-file
-    # progress, runs with stdin=DEVNULL + start_new_session so it can't hang
-    # on a password prompt, and is watchdog-protected. patoolib (which shells
-    # out to ``unar`` by default) has neither progress nor protection from
-    # those hangs, and is only useful as a last resort if 7z truly can't
-    # open the archive at all.
+    # For ``.rar``, prefer the proprietary ``unrar`` binary when installed:
+    # it's the RARLab reference implementation, is the only free tool that
+    # handles RAR5 correctly, and has a native ``-p-`` flag that skips
+    # password-protected entries non-interactively. This matters because
+    # p7zip 16.02 (the Debian 12 default) has no RAR5 support and hangs
+    # on per-entry encryption even with stdin=DEVNULL / setsid.
+    #
+    # Fall through to ``_extract_with_7z`` if unrar isn't available or
+    # failed. Both paths are hardened against stdin prompts and have a
+    # watchdog. patoolib is kept as an absolute last resort for exotic
+    # formats (e.g. ACE, ARJ) that neither 7z nor unrar handle.
     import shutil as _shutil
 
     has_tool = (
@@ -646,27 +783,35 @@ def _extract_archive(
     if not has_tool:
         raise RuntimeError(
             "No extraction tool found for this archive format. "
-            "Install p7zip-full on the server: "
-            "apt-get install -y p7zip-full"
+            "Install p7zip-full + unrar on the server: "
+            "apt-get install -y p7zip-full unrar"
         )
 
+    first_exc: Optional[Exception] = None
+
+    # Try unrar first for .rar files (best RAR5 + encrypted-entry support).
+    if sniffed == "rar" and _shutil.which("unrar"):
+        try:
+            _extract_with_unrar(archive_path, dest, progress)
+            return
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("unrar extraction failed ({}), falling back to 7z", exc)
+            first_exc = exc
+
+    # Try 7z next.
     try:
         _extract_with_7z(archive_path, dest, progress)
         return
     except ValueError:
         raise
     except Exception as exc:
-        # Only fall back to patoolib if 7z couldn't extract a single entry.
-        # If 7z managed to extract anything, _extract_with_7z would have
-        # returned successfully via the partial-success path instead of
-        # raising, so reaching here means the archive is genuinely
-        # unreadable by 7z.
+        # Last resort: patoolib. It has no progress callback and no stdin
+        # protection, but handles some formats 7z/unrar don't (e.g. ACE).
         logger.warning("7z extraction failed ({}), trying patoolib as last resort", exc)
         try:
             import patoolib
-            # patoolib has no progress callback or stdin control, so the
-            # directory-count poller is the only way to advance the
-            # dashboard during this step.
             with _DirCountPoller(dest, progress):
                 patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
             _validate_extracted_paths(dest)
@@ -674,9 +819,14 @@ def _extract_archive(
         except ValueError:
             raise
         except Exception as exc2:
+            parts = []
+            if first_exc is not None:
+                parts.append(f"unrar: {first_exc}")
+            parts.append(f"7z: {exc}")
+            parts.append(f"patoolib: {exc2}")
             raise RuntimeError(
-                f"Both 7z and patoolib failed to extract the archive. "
-                f"7z: {exc}; patoolib: {exc2}"
+                "All extraction tools failed on this archive. "
+                + "; ".join(parts)
             ) from exc2
 
 
