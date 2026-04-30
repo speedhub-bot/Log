@@ -236,31 +236,112 @@ def _safe_tar_extract(tf: tarfile.TarFile, dest: str) -> None:
     tf.extractall(dest, members=safe_members)
 
 
-def _extract_archive(archive_path: str, dest: str) -> None:
-    """Extract an archive into *dest* using the appropriate tool."""
-    lower = archive_path.lower()
-    if lower.endswith(".zip"):
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            _safe_zip_extract(zf, dest)
-    elif lower.endswith((".tar.gz", ".tgz", ".tar.bz2")):
-        with tarfile.open(archive_path, "r:*") as tf:
-            _safe_tar_extract(tf, dest)
-    else:
-        # .rar / .7z — delegate to patool (requires system tools)
-        import shutil as _shutil
 
-        import patoolib
+def _is_split_archive(path: str) -> bool:
+    """Detect split/multipart archive naming patterns."""
+    base = os.path.basename(path).lower()
+    if re.search(r"\.part-?\d+\.zip$", base):
+        return True
+    if re.search(r"\.part-?\d+\.rar$", base):
+        return True
+    if re.search(r"\.part-?\d+\.7z$", base):
+        return True
+    if re.search(r"\.zip\.\d+$", base):
+        return True
+    if re.search(r"\.7z\.\d+$", base):
+        return True
+    return False
 
-        has_tool = (
-            _shutil.which("unrar") or _shutil.which("7z") or _shutil.which("unar")
+
+def _validate_extracted_paths(dest: str) -> None:
+    """Post-extraction check: ensure no file escaped the destination directory."""
+    dest_real = os.path.realpath(dest)
+    for root, dirs, files in os.walk(dest):
+        for name in files + dirs:
+            full = os.path.realpath(os.path.join(root, name))
+            if not full.startswith(dest_real + os.sep) and full != dest_real:
+                raise ValueError(f"Path traversal detected after extraction: {name}")
+
+
+def _extract_with_7z(archive_path: str, dest: str) -> None:
+    """Extract using 7z command-line tool (handles split archives, damaged files, etc.)."""
+    import shutil as _shutil
+
+    sz = _shutil.which("7z")
+    if not sz:
+        raise RuntimeError(
+            "7z not found. Install with: apt-get install -y p7zip-full"
         )
-        if not has_tool:
-            raise RuntimeError(
-                "No extraction tool found for this archive format. "
-                "Install unrar or p7zip-full on the server: "
-                "sudo apt-get install -y unrar p7zip-full"
-            )
+    result = subprocess.run(
+        [sz, "x", archive_path, f"-o{dest}", "-y", "-bso0", "-bse1"],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"7z extraction failed: {result.stderr.strip()}")
+    _validate_extracted_paths(dest)
+
+
+def _extract_archive(archive_path: str, dest: str) -> None:
+    """Extract an archive into *dest* using the best available tool.
+
+    Strategy:
+    1. Split/multipart archives → 7z directly (Python can't handle these)
+    2. Regular .zip → try zipfile, fall back to 7z
+    3. Regular .tar.gz/.tgz/.tar.bz2 → try tarfile, fall back to 7z
+    4. .rar / .7z / other → try patoolib, fall back to 7z
+    """
+    lower = archive_path.lower()
+
+    # Split archives — go straight to 7z
+    if _is_split_archive(archive_path):
+        logger.info("Split archive detected, using 7z: {}", archive_path)
+        _extract_with_7z(archive_path, dest)
+        return
+
+    # Regular .zip
+    if lower.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                _safe_zip_extract(zf, dest)
+            return
+        except (zipfile.BadZipFile, OSError) as exc:
+            logger.warning("zipfile failed ({}), falling back to 7z", exc)
+            _extract_with_7z(archive_path, dest)
+            return
+
+    # Tarballs
+    if lower.endswith((".tar.gz", ".tgz", ".tar.bz2")):
+        try:
+            with tarfile.open(archive_path, "r:*") as tf:
+                _safe_tar_extract(tf, dest)
+            return
+        except (tarfile.TarError, OSError) as exc:
+            logger.warning("tarfile failed ({}), falling back to 7z", exc)
+            _extract_with_7z(archive_path, dest)
+            return
+
+    # .rar / .7z / other — try patoolib first, then 7z
+    import shutil as _shutil
+
+    has_tool = (
+        _shutil.which("unrar") or _shutil.which("7z") or _shutil.which("unar")
+    )
+    if not has_tool:
+        raise RuntimeError(
+            "No extraction tool found for this archive format. "
+            "Install p7zip-full on the server: "
+            "apt-get install -y p7zip-full"
+        )
+    try:
+        import patoolib
         patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
+    except Exception as exc:
+        if isinstance(exc, ValueError):
+            raise
+        logger.warning("patoolib failed ({}), falling back to 7z", exc)
+        _extract_with_7z(archive_path, dest)
 
 
 def _write_output_chunks(
