@@ -427,9 +427,15 @@ def _extract_with_7z(
     # We capture stderr below and parse per-file progress lines from it.
     # A directory-count poller runs alongside as a robust fallback so the
     # dashboard advances even if 7z's progress output format changes.
+    # stdin=DEVNULL is critical: if the archive contains a password-protected
+    # entry, 7z will otherwise prompt on stdin and hang indefinitely (there's
+    # no TTY attached when running under screen/nohup). DEVNULL gives 7z an
+    # immediate EOF, which makes it fail that file with a non-zero exit code
+    # rather than blocking forever.
     proc = subprocess.Popen(
         [sz, "x", archive_path, f"-o{dest}", "-y",
          "-bb1", "-bso2", "-bse2", "-bsp2"],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -472,9 +478,23 @@ def _extract_with_7z(
         # Caller will short-circuit; don't raise.
         return
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"7z extraction failed: {''.join(stderr_chunks).strip()[:500]}"
-        )
+        # If at least some files made it out, treat this as a partial success
+        # rather than aborting the whole job. Common cause: a single
+        # password-protected entry inside an otherwise-fine archive (e.g. a
+        # bundled "KeyGen.rar" inside a log dump). We still want the cookies
+        # from the 95% that extracted cleanly.
+        if progress is not None and progress.extract_current > 0:
+            logger.warning(
+                "7z exited with code {} after extracting {} entries; "
+                "treating as partial success. Last error output: {}",
+                proc.returncode,
+                progress.extract_current,
+                "".join(stderr_chunks[-5:]).strip()[:200],
+            )
+        else:
+            raise RuntimeError(
+                f"7z extraction failed: {''.join(stderr_chunks).strip()[:500]}"
+            )
     _validate_extracted_paths(dest)
 
 
