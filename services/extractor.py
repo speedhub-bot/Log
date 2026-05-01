@@ -16,10 +16,11 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Union
 
 from loguru import logger
 
@@ -27,16 +28,39 @@ import config
 
 
 # ════════════════════════════════════════════════════════════
-#  SmartCookieExtractor
+#  SmartCookieExtractor  — REUSED EXACTLY AS-IS
 # ════════════════════════════════════════════════════════════
+
+def _coerce_domains(domain: Union[str, Iterable[str]]) -> List[str]:
+    """Normalise *domain* into a deduplicated list of lowercase domains.
+
+    Accepts a single string or any iterable of strings. Empty / blank
+    entries and leading dots are stripped. Order is preserved.
+    """
+    if isinstance(domain, str):
+        candidates = [domain]
+    else:
+        candidates = list(domain)
+    cleaned: List[str] = []
+    seen = set()
+    for d in candidates:
+        if not isinstance(d, str):
+            continue
+        norm = d.strip().lower().lstrip(".")
+        if norm and norm not in seen:
+            seen.add(norm)
+            cleaned.append(norm)
+    return cleaned
+
 
 class SmartCookieExtractor:
     """Efficiently extracts cookies from Netscape cookie format files.
 
     Supports filtering against a single target domain or multiple target
     domains in a single pass. When multiple domains are provided each cookie
-    line is matched against every target and routed to the first matching
-    target via :meth:`match_domain`.
+    dict is tagged with a ``target_domain`` key naming whichever configured
+    domain it matched, so callers can route per-domain without rerunning
+    the parse.
     """
 
     def __init__(
@@ -44,71 +68,59 @@ class SmartCookieExtractor:
         domain: Union[str, Iterable[str]],
         patterns: Optional[List[str]] = None,
     ):
-        """
-        Initialize extractor
+        """Initialise extractor.
 
         Args:
-            domain: A single domain (e.g. ``'spotify.com'``) or an iterable of
-                domains (e.g. ``['spotify.com', 'netflix.com']``) to filter
-                cookies against.
+            domain: A single domain string (e.g. ``"spotify.com"``) or an
+                iterable of domain strings to filter against.
             patterns: Optional regex patterns for additional filtering.
         """
-        if isinstance(domain, str):
-            domains: List[str] = [domain]
-        else:
-            domains = list(domain)
-
-        # Normalise: lower-case, strip leading dots, drop empties, dedupe.
-        seen: set[str] = set()
-        cleaned: List[str] = []
-        for d in domains:
-            norm = d.lower().lstrip(".").strip()
-            if norm and norm not in seen:
-                seen.add(norm)
-                cleaned.append(norm)
-        if not cleaned:
+        domains = _coerce_domains(domain)
+        if not domains:
             raise ValueError("SmartCookieExtractor requires at least one domain")
-
-        self.domains: List[str] = cleaned
-        # Back-compat: single-domain callers still read ``.domain``.
-        self.domain: str = cleaned[0]
+        self.domains: List[str] = domains
+        # Back-compat: single ``self.domain`` attr keeps pointing at the
+        # primary (first) target so older callers keep working.
+        self.domain: str = domains[0]
         self.patterns = patterns or []
         self.domain_pattern = re.compile(
-            "(" + "|".join(re.escape(d) for d in cleaned) + ")",
-            re.IGNORECASE,
+            rf"({re.escape(self.domain)})", re.IGNORECASE,
         )
 
     def extract_from_file(self, filepath: str) -> List[Dict[str, str]]:
         """
-        Extract cookies from a Netscape cookie format file.
+        Extract cookies from Netscape format cookie file
 
-        Returns a flat list of cookie dicts that match *any* configured
-        target domain. The matched target is recorded in each dict's
-        ``target_domain`` key so callers routing per-domain output do not
-        have to recompute matches.
+        Args:
+            filepath: Path to cookie file
+
+        Returns:
+            List of cookie dictionaries
         """
-        results: List[Dict[str, str]] = []
         fp = Path(filepath)
-
         if not fp.exists():
             raise FileNotFoundError(f"File not found: {fp}")
-
         with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-            for _line_num, line in enumerate(f, 1):
-                line = line.strip()
+            return self.extract_from_text(f.read())
 
-                # Skip empty lines and comments
-                if not line or line.startswith("#"):
-                    continue
+    def extract_from_text(self, text: str) -> List[Dict[str, str]]:
+        """Extract cookies from a raw Netscape-format cookies string.
 
-                cookie = self.parse_cookie_line(line)
-                if cookie is None:
-                    continue
-                target = self.match_domain(cookie["domain"])
-                if target is not None:
-                    cookie["target_domain"] = target
-                    results.append(cookie)
-
+        Lets streaming code paths (e.g. in-memory decompressed zip
+        entries) reuse the same parser without writing to disk.
+        """
+        results: List[Dict[str, str]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            cookie = self.parse_cookie_line(line)
+            if cookie is None:
+                continue
+            target = self.match_domain(cookie["domain"])
+            if target is not None:
+                cookie["target_domain"] = target
+                results.append(cookie)
         return results
 
     def parse_cookie_line(self, line: str) -> Optional[Dict[str, str]]:
@@ -143,7 +155,7 @@ class SmartCookieExtractor:
     def match_domain(self, cookie_domain: str) -> Optional[str]:
         """Return the configured target domain that matches *cookie_domain*.
 
-        Match rules (per target):
+        Match rules (per configured target):
           * exact match, or
           * cookie domain is a subdomain of the target, or
           * target is a subdomain of the cookie domain (legacy permissive
@@ -162,7 +174,7 @@ class SmartCookieExtractor:
         return None
 
     def _matches_domain(self, cookie_domain: str) -> bool:
-        """Back-compat alias used by older callers."""
+        """Back-compat alias used by older single-domain callers."""
         return self.match_domain(cookie_domain) is not None
 
     def extract_from_directory(
@@ -188,14 +200,11 @@ class SmartCookieExtractor:
         if not dir_path.exists():
             raise FileNotFoundError(f"Directory not found: {dir_path}")
 
-        # When real-time saving is enabled, create one sub-directory per
-        # configured target domain so output stays cleanly partitioned.
-        domain_output_dirs: Dict[str, Path] = {}
+        # Setup output directory structure if real-time saving
+        domain_output_dir: Optional[Path] = None
         if realtime_save and output_dir:
-            for d in self.domains:
-                p = Path(output_dir) / d
-                p.mkdir(parents=True, exist_ok=True)
-                domain_output_dirs[d] = p
+            domain_output_dir = Path(output_dir) / self.domain
+            domain_output_dir.mkdir(parents=True, exist_ok=True)
 
         # Find all .txt files in Cookies subdirectories
         cookie_files: List[Path] = []
@@ -211,36 +220,26 @@ class SmartCookieExtractor:
             except Exception:
                 pass
 
-        file_counters: Dict[str, int] = {d: 1 for d in self.domains}
-        for filepath in cookie_files:
+        file_counter = 1
+        for i, filepath in enumerate(cookie_files, 1):
             try:
                 cookies = self.extract_from_file(str(filepath))
-                if not cookies:
-                    continue
-                results[str(filepath)] = cookies
+                if cookies:
+                    results[str(filepath)] = cookies
 
-                if not (realtime_save and domain_output_dirs):
-                    continue
+                    if realtime_save and domain_output_dir:
+                        output_filename = f"akaza_{self.domain}_{file_counter}.txt"
+                        output_path = domain_output_dir / output_filename
 
-                # Group cookies by their matched target domain.
-                grouped: Dict[str, List[Dict[str, str]]] = {}
-                for c in cookies:
-                    grouped.setdefault(c["target_domain"], []).append(c)
+                        with open(output_path, "w", encoding="utf-8") as f:
+                            for cookie in cookies:
+                                f.write(
+                                    f"{cookie['domain']}\t{cookie['flag']}\t{cookie['path']}\t"
+                                    f"{cookie['secure']}\t{cookie['expiration']}\t"
+                                    f"{cookie['name']}\t{cookie['value']}\n"
+                                )
 
-                for target, items in grouped.items():
-                    out_dir = domain_output_dirs.get(target)
-                    if out_dir is None:
-                        continue
-                    idx = file_counters[target]
-                    output_path = out_dir / f"akaza_{target}_{idx}.txt"
-                    with open(output_path, "w", encoding="utf-8") as f:
-                        for cookie in items:
-                            f.write(
-                                f"{cookie['domain']}\t{cookie['flag']}\t{cookie['path']}\t"
-                                f"{cookie['secure']}\t{cookie['expiration']}\t"
-                                f"{cookie['name']}\t{cookie['value']}\n"
-                            )
-                    file_counters[target] = idx + 1
+                        file_counter += 1
             except Exception:
                 pass
 
@@ -278,8 +277,9 @@ class ExtractionResult:
     error: str = ""
     duration_seconds: float = 0.0
     partial: bool = False           # True when results came from a cancelled job
-    # Per-target-domain cookie counts. Empty for legacy single-domain callers
-    # that don't care about the breakdown.
+    # Per-target-domain cookie counts. Only populated when the extractor
+    # was configured for one or more domains; keys are the cleaned target
+    # domain strings.
     per_domain_counts: Dict[str, int] = field(default_factory=dict)
 
 
@@ -336,6 +336,196 @@ def _safe_tar_extract(
         if progress is not None:
             progress.extract_current += 1
 
+
+
+def _probe_encrypted_entries(archive_path: str) -> List[str]:
+    """Return a list of password-protected entry names inside *archive_path*.
+
+    Returns an empty list if the archive has no encrypted entries, or if
+    we can't tell (missing tools, unknown format). Never raises.
+
+    Detection order:
+      * For ``.rar``: prefer ``unrar lt -p-`` and look for ``Flags: enc``.
+      * Fallback / other formats: ``7z l -slt`` and look for
+        ``Encrypted = +``.
+    """
+    import shutil as _shutil
+
+    lower = archive_path.lower()
+    encrypted: List[str] = []
+
+    if lower.endswith(".rar"):
+        unrar = _shutil.which("unrar")
+        if unrar:
+            try:
+                proc = subprocess.run(
+                    [unrar, "lt", "-p-", archive_path],
+                    capture_output=True, text=True, timeout=60,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                # ``lt`` (technical listing) emits blocks like:
+                #     Name: foo.txt
+                #     ...
+                #     Flags: encrypted
+                # We parse blocks split on "Name:" lines.
+                blocks = re.split(r"(?m)^Name:\s+", proc.stdout)
+                for blk in blocks[1:]:
+                    first_nl = blk.find("\n")
+                    name = blk[:first_nl].strip() if first_nl >= 0 else blk.strip()
+                    if re.search(r"(?mi)^\s*Flags:.*encrypted", blk):
+                        encrypted.append(name)
+                if encrypted:
+                    return encrypted
+            except Exception as exc:
+                logger.debug("unrar probe failed ({}); falling back", exc)
+
+    sz = _shutil.which("7z")
+    if sz:
+        try:
+            proc = subprocess.run(
+                [sz, "l", "-slt", archive_path],
+                capture_output=True, text=True, timeout=60,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            cur_name: Optional[str] = None
+            for line in proc.stdout.splitlines():
+                if line.startswith("Path = "):
+                    cur_name = line[len("Path = "):].strip()
+                elif line.startswith("Encrypted = +") and cur_name:
+                    encrypted.append(cur_name)
+        except Exception as exc:
+            logger.debug("7z probe failed ({})", exc)
+
+    return encrypted
+
+
+_COMMON_PASSWORDS: List[str] = [
+    # Default lazy passwords — ordered by prevalence in stealer-log dumps.
+    "1234", "0000", "pass", "password", "123456", "12345",
+    "admin", "root", "logs", "log", "rar", "zip", "test",
+    "cookies", "archive", "akaza", "free", "vip",
+]
+
+
+def _password_candidates(archive_path: str) -> List[str]:
+    """Build the list of passwords to try for *archive_path*.
+
+    Combines:
+      * ``_COMMON_PASSWORDS`` (default stealer-dump passwords).
+      * Tokens derived from the filename: the full basename (with and
+        without extension), and splits on common separators.
+      * Any ``@TAG`` substrings in the filename (channel handles like
+        ``@HARMONYLOGS`` — dump authors frequently use these as passwords).
+    """
+    base = os.path.basename(archive_path)
+    stem = base
+    # Strip up to two extensions so ``foo.tar.gz`` becomes ``foo``.
+    for _ in range(2):
+        if "." in stem:
+            stem = stem.rsplit(".", 1)[0]
+
+    seen: "set[str]" = set()
+    out: List[str] = []
+
+    def _push(val: str) -> None:
+        val = val.strip()
+        if not val:
+            return
+        if val in seen:
+            return
+        seen.add(val)
+        out.append(val)
+
+    for pwd in _COMMON_PASSWORDS:
+        _push(pwd)
+
+    _push(stem)
+    _push(stem.lower())
+    _push(stem.upper())
+
+    # Channel-handle style: ``@Something`` tokens.
+    for m in re.findall(r"@[A-Za-z0-9_]+", base):
+        _push(m)            # with @
+        _push(m.lstrip("@"))
+
+    # Split on common separators.
+    for tok in re.split(r"[\s._\-#@()\[\]{}]+", stem):
+        _push(tok)
+        _push(tok.lower())
+
+    return out
+
+
+def _try_archive_password(archive_path: str, password: str) -> bool:
+    """Return True if *password* successfully decrypts *archive_path*.
+
+    Uses ``unrar t -p<pwd>`` for RAR (exit 0 = ok, 11 = wrong pwd) and
+    ``7z t -p<pwd>`` for the rest (exit 0 = ok, 2 = wrong pwd).
+
+    Pipes ``-y`` / stdin=DEVNULL so the tool never hangs prompting.
+    Gives each attempt 30s before giving up.
+    """
+    import shutil as _shutil
+
+    lower = archive_path.lower()
+
+    if lower.endswith(".rar"):
+        unrar = _shutil.which("unrar")
+        if unrar:
+            try:
+                rc = subprocess.run(
+                    [unrar, "t", f"-p{password}", "-y", "-inul", archive_path],
+                    capture_output=True, timeout=30,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                ).returncode
+                return rc == 0
+            except Exception:
+                return False
+
+    sz = _shutil.which("7z")
+    if sz:
+        try:
+            rc = subprocess.run(
+                [sz, "t", f"-p{password}", archive_path],
+                capture_output=True, timeout=30,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            ).returncode
+            return rc == 0
+        except Exception:
+            return False
+
+    return False
+
+
+def guess_archive_password(archive_path: str) -> Optional[str]:
+    """Try the password candidate list against *archive_path*.
+
+    Returns the first password that successfully tests, or ``None`` if
+    none of the candidates worked. Runs sequentially — candidate list
+    is short enough (~30 entries) that parallelism isn't worth the
+    extra fork overhead.
+    """
+    candidates = _password_candidates(archive_path)
+    logger.info(
+        "Trying {} candidate passwords for {}",
+        len(candidates), os.path.basename(archive_path),
+    )
+    for pwd in candidates:
+        if _try_archive_password(archive_path, pwd):
+            logger.info(
+                "Password auto-guess hit for {}: {!r}",
+                os.path.basename(archive_path), pwd,
+            )
+            return pwd
+    logger.info(
+        "Password auto-guess exhausted for {} ({} candidates tried)",
+        os.path.basename(archive_path), len(candidates),
+    )
+    return None
 
 
 def _is_split_archive(path: str) -> bool:
@@ -449,6 +639,7 @@ def _extract_with_7z(
     archive_path: str,
     dest: str,
     progress: Optional["ExtractionProgress"] = None,
+    password: Optional[str] = None,
 ) -> None:
     """Extract using 7z command-line tool with live per-file progress.
 
@@ -466,11 +657,20 @@ def _extract_with_7z(
         )
 
     # First, count entries so we can show a real progress bar.
+    # stdin=DEVNULL + start_new_session=True for the listing step too:
+    # archives with encrypted headers (``-mhe=on``) require the password
+    # to even read the file list, and 7z would otherwise hang prompting
+    # before extraction even begins.
+    list_cmd = [sz, "l", "-slt", archive_path]
+    if password:
+        list_cmd.append(f"-p{password}")
     if progress is not None:
         try:
             count_proc = subprocess.run(
-                [sz, "l", "-slt", archive_path],
-                capture_output=True, text=True, timeout=120,
+                list_cmd,
+                capture_output=True, text=True, timeout=60,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
             if count_proc.returncode == 0:
                 # "Path =" lines, minus the archive header line.
@@ -492,16 +692,69 @@ def _extract_with_7z(
     # We capture stderr below and parse per-file progress lines from it.
     # A directory-count poller runs alongside as a robust fallback so the
     # dashboard advances even if 7z's progress output format changes.
+    # stdin=DEVNULL + start_new_session=True together neutralise every way
+    # 7z could otherwise hang on a password prompt:
+    #   * stdin=DEVNULL gives 7z immediate EOF when it tries to read input.
+    #   * start_new_session=True puts 7z in its own process group with no
+    #     controlling terminal, so even if it tries to open /dev/tty
+    #     directly to bypass stdin (some builds do that), the open fails.
+    # Combined effect: 7z fails any password-protected entry with a
+    # non-zero exit code rather than blocking forever.
+    extract_cmd = [
+        sz, "x", archive_path, f"-o{dest}", "-y",
+        "-bb1", "-bso2", "-bse2", "-bsp2",
+    ]
+    if password:
+        extract_cmd.append(f"-p{password}")
     proc = subprocess.Popen(
-        [sz, "x", archive_path, f"-o{dest}", "-y",
-         "-bb1", "-bso2", "-bse2", "-bsp2"],
+        extract_cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     stderr_chunks: List[str] = []
     file_lines_seen = 0
+    # Watchdog: if neither the line parser nor the directory poller
+    # advance progress for this many seconds, assume the underlying tool
+    # is wedged and kill it. Picked generously so big-file decompression
+    # still finishes naturally.
+    WATCHDOG_IDLE_SECONDS = 90.0
+    last_progress_count = 0
+    last_progress_time = time.monotonic()
+    stop_watchdog = threading.Event()
+
+    def _watchdog() -> None:
+        nonlocal last_progress_count, last_progress_time
+        while not stop_watchdog.wait(5.0):
+            if proc.poll() is not None:
+                return
+            current = (
+                progress.extract_current
+                if progress is not None
+                else file_lines_seen
+            )
+            if current > last_progress_count:
+                last_progress_count = current
+                last_progress_time = time.monotonic()
+                continue
+            if time.monotonic() - last_progress_time > WATCHDOG_IDLE_SECONDS:
+                logger.error(
+                    "7z made no progress for {}s (stuck at {} entries); "
+                    "terminating.",
+                    int(WATCHDOG_IDLE_SECONDS), current,
+                )
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
+
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
+
     try:
         assert proc.stderr is not None
         with _DirCountPoller(dest, progress):
@@ -532,14 +785,198 @@ def _extract_with_7z(
     except Exception:
         proc.kill()
         raise
+    finally:
+        stop_watchdog.set()
+        watchdog_thread.join(timeout=2.0)
 
     if progress is not None and progress.cancelled:
         # Caller will short-circuit; don't raise.
         return
+
+    # Ground-truth the file count — see identical logic in
+    # _extract_with_unrar for the reasoning.
+    actual_count = 0
+    for _r, _d, files in os.walk(dest):
+        actual_count += len(files)
+    if progress is not None:
+        progress.extract_current = max(progress.extract_current, actual_count)
+
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"7z extraction failed: {''.join(stderr_chunks).strip()[:500]}"
-        )
+        # If at least some files made it out, treat this as a partial success
+        # rather than aborting the whole job. Common cause: a single
+        # password-protected entry inside an otherwise-fine archive (e.g. a
+        # bundled "KeyGen.rar" inside a log dump). We still want the cookies
+        # from the 95% that extracted cleanly.
+        if actual_count > 0:
+            logger.warning(
+                "7z exited with code {} after extracting {} files; "
+                "treating as partial success. Last error output: {}",
+                proc.returncode,
+                actual_count,
+                "".join(stderr_chunks[-5:]).strip()[:200],
+            )
+        else:
+            raise RuntimeError(
+                f"7z extraction failed: {''.join(stderr_chunks).strip()[:2000]}"
+            )
+    _validate_extracted_paths(dest)
+
+
+def _extract_with_unrar(
+    archive_path: str,
+    dest: str,
+    progress: Optional["ExtractionProgress"] = None,
+    password: Optional[str] = None,
+) -> None:
+    """Extract a .rar archive with the proprietary ``unrar`` binary.
+
+    unrar is RARLab's reference implementation and is the only free tool
+    that correctly handles RAR5 format plus per-entry password protection.
+    We pass ``-p-`` to make it skip password-protected entries silently
+    instead of prompting, and ``-o+`` to overwrite any conflicts.
+
+    A ``_DirCountPoller`` advances the dashboard (unrar doesn't stream
+    per-file progress in a structured format), and the same watchdog
+    pattern as 7z guards against hangs.
+    """
+    import shutil as _shutil
+
+    unrar = _shutil.which("unrar")
+    if not unrar:
+        raise RuntimeError("unrar not found")
+
+    # ``-p<password>`` unlocks encrypted entries without prompting.
+    # ``-p-`` keeps the old skip-encrypted behaviour when no password
+    # was provided.
+    pw_flag = f"-p{password}" if password else "-p-"
+
+    # Count entries first for the progress bar.
+    if progress is not None:
+        try:
+            count_proc = subprocess.run(
+                [unrar, "lb", pw_flag, archive_path],
+                capture_output=True, text=True, timeout=60,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            if count_proc.returncode == 0:
+                lines = [
+                    ln for ln in count_proc.stdout.splitlines() if ln.strip()
+                ]
+                progress.extract_total = len(lines)
+                progress.extract_current = 0
+        except Exception as exc:
+            logger.debug(
+                "unrar list failed ({}); progress count unavailable", exc
+            )
+
+    # ``x``    extract with full paths
+    # ``-p-``  never ask for password; skip encrypted entries with error
+    # ``-o+``  overwrite existing files without prompting
+    # ``-y``   yes to all queries
+    # ``-idq`` quiet mode (reduce noise)
+    proc = subprocess.Popen(
+        [unrar, "x", pw_flag, "-o+", "-y", archive_path, dest + os.sep],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    output_chunks: List[str] = []
+    WATCHDOG_IDLE_SECONDS = 90.0
+    last_progress_count = 0
+    last_progress_time = time.monotonic()
+    stop_watchdog = threading.Event()
+
+    def _watchdog() -> None:
+        nonlocal last_progress_count, last_progress_time
+        while not stop_watchdog.wait(5.0):
+            if proc.poll() is not None:
+                return
+            current = progress.extract_current if progress is not None else 0
+            if current > last_progress_count:
+                last_progress_count = current
+                last_progress_time = time.monotonic()
+                continue
+            if time.monotonic() - last_progress_time > WATCHDOG_IDLE_SECONDS:
+                logger.error(
+                    "unrar made no progress for {}s (stuck at {} entries); "
+                    "terminating.",
+                    int(WATCHDOG_IDLE_SECONDS), current,
+                )
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
+
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
+
+    try:
+        assert proc.stdout is not None
+        with _DirCountPoller(dest, progress):
+            for line in proc.stdout:
+                output_chunks.append(line)
+                cleaned = line.strip()
+                if not cleaned:
+                    continue
+                # unrar emits lines like "Extracting  dir/file.txt"
+                m = re.match(r"Extracting\s+(.+?)(?:\s+OK\s*)?$", cleaned)
+                if m and progress is not None:
+                    name = m.group(1).strip()
+                    progress.current_file = os.path.basename(name) or name
+                if progress is not None and progress.cancelled:
+                    proc.terminate()
+                    break
+            proc.wait(timeout=60)
+    except Exception:
+        proc.kill()
+        raise
+    finally:
+        stop_watchdog.set()
+        watchdog_thread.join(timeout=2.0)
+
+    if progress is not None and progress.cancelled:
+        return
+
+    # Ground-truth the extracted file count by walking the destination
+    # directory. _DirCountPoller may have missed the final state, and
+    # progress.extract_current can lag behind reality right after the
+    # process exits. This gives us an authoritative number to decide
+    # whether we got partial success.
+    actual_count = 0
+    for _r, _d, files in os.walk(dest):
+        actual_count += len(files)
+    if progress is not None:
+        progress.extract_current = max(progress.extract_current, actual_count)
+
+    # unrar exit codes:
+    #   0    success
+    #   1    non-fatal warning (still success for us)
+    #   3    corrupt header / CRC (can be partial)
+    #   10   nothing to extract (hard failure if count==0, partial otherwise)
+    #   11   wrong password — an archive-wide or per-entry password issue;
+    #        with -p- any encrypted entry triggers this. If other entries
+    #        extracted cleanly this is a partial success.
+    # Anything else we treat as a hard failure iff nothing was extracted.
+    if proc.returncode not in (0, 1):
+        if actual_count > 0:
+            logger.warning(
+                "unrar exited with code {} after extracting {} files; "
+                "treating as partial success (archive likely has "
+                "password-protected entries). Last output: {}",
+                proc.returncode,
+                actual_count,
+                "".join(output_chunks[-5:]).strip()[:200],
+            )
+        else:
+            raise RuntimeError(
+                f"unrar extraction failed (exit {proc.returncode}): "
+                f"{''.join(output_chunks).strip()[:2000]}"
+            )
     _validate_extracted_paths(dest)
 
 
@@ -547,6 +984,7 @@ def _extract_archive(
     archive_path: str,
     dest: str,
     progress: Optional["ExtractionProgress"] = None,
+    password: Optional[str] = None,
 ) -> None:
     """Extract an archive into *dest* using the best available tool.
 
@@ -570,7 +1008,7 @@ def _extract_archive(
     # Split archives — go straight to 7z
     if _is_split_archive(archive_path):
         logger.info("Split archive detected, using 7z: {}", archive_path)
-        _extract_with_7z(archive_path, dest, progress)
+        _extract_with_7z(archive_path, dest, progress, password=password)
         return
 
     # Determine the real archive format from the file's magic bytes; if
@@ -597,8 +1035,10 @@ def _extract_archive(
             sniffed, _ext_kind(lower),
         )
 
-    # Pure-Python zip
-    if sniffed == "zip":
+    # Pure-Python zip. Skip it when a password is provided; stdlib
+    # ``zipfile`` only supports the weak ZipCrypto password format, and
+    # falling straight to 7z gives us AES-protected zip support for free.
+    if sniffed == "zip" and not password:
         try:
             with zipfile.ZipFile(archive_path, "r") as zf:
                 _safe_zip_extract(zf, dest, progress)
@@ -607,8 +1047,11 @@ def _extract_archive(
             raise
         except Exception as exc:
             logger.warning("zipfile failed ({}), falling back to 7z", exc)
-            _extract_with_7z(archive_path, dest, progress)
+            _extract_with_7z(archive_path, dest, progress, password=password)
             return
+    if sniffed == "zip":  # password provided — go straight to 7z
+        _extract_with_7z(archive_path, dest, progress, password=password)
+        return
 
     # Pure-Python tarball (gzip / bzip2 / xz / plain tar)
     if sniffed in ("gz", "bz2", "xz"):
@@ -620,10 +1063,22 @@ def _extract_archive(
             raise
         except Exception as exc:
             logger.warning("tarfile failed ({}), falling back to 7z", exc)
-            _extract_with_7z(archive_path, dest, progress)
+            _extract_with_7z(archive_path, dest, progress, password=password)
             return
 
-    # .rar / .7z / unknown — try patoolib first, then 7z
+    # .rar / .7z / unknown.
+    #
+    # For ``.rar``, prefer the proprietary ``unrar`` binary when installed:
+    # it's the RARLab reference implementation, is the only free tool that
+    # handles RAR5 correctly, and has a native ``-p-`` flag that skips
+    # password-protected entries non-interactively. This matters because
+    # p7zip 16.02 (the Debian 12 default) has no RAR5 support and hangs
+    # on per-entry encryption even with stdin=DEVNULL / setsid.
+    #
+    # Fall through to ``_extract_with_7z`` if unrar isn't available or
+    # failed. Both paths are hardened against stdin prompts and have a
+    # watchdog. patoolib is kept as an absolute last resort for exotic
+    # formats (e.g. ACE, ARJ) that neither 7z nor unrar handle.
     import shutil as _shutil
 
     has_tool = (
@@ -632,22 +1087,68 @@ def _extract_archive(
     if not has_tool:
         raise RuntimeError(
             "No extraction tool found for this archive format. "
-            "Install p7zip-full on the server: "
-            "apt-get install -y p7zip-full"
+            "Install p7zip-full + unrar on the server: "
+            "apt-get install -y p7zip-full unrar"
         )
+
+    unrar_path = _shutil.which("unrar")
+    sevenz_path = _shutil.which("7z")
+    logger.info(
+        "Extracting {} (sniffed={}); available tools: unrar={}, 7z={}",
+        archive_path, sniffed, unrar_path, sevenz_path,
+    )
+
+    errors: List[str] = []
+
+    # Try unrar first for .rar files (best RAR5 + encrypted-entry support).
+    if sniffed == "rar" and unrar_path:
+        logger.info("Trying unrar first for {}", archive_path)
+        try:
+            _extract_with_unrar(archive_path, dest, progress, password=password)
+            logger.info("unrar extraction succeeded for {}", archive_path)
+            return
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("unrar extraction failed ({}), falling back to 7z", exc)
+            errors.append(f"unrar: {exc}")
+
+    # Try 7z next.
+    if sevenz_path:
+        logger.info("Trying 7z for {}", archive_path)
+        try:
+            _extract_with_7z(archive_path, dest, progress, password=password)
+            logger.info("7z extraction succeeded for {}", archive_path)
+            return
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("7z extraction failed ({}), trying patoolib", exc)
+            errors.append(f"7z: {exc}")
+
+    # Last resort: patoolib.
+    logger.info("Trying patoolib as final fallback for {}", archive_path)
     try:
         import patoolib
-        # patoolib has no progress callback, so a directory-count poller is
-        # the only way to advance the dashboard during this step.
         with _DirCountPoller(dest, progress):
             patoolib.extract_archive(archive_path, outdir=dest, interactive=False)
         _validate_extracted_paths(dest)
+        logger.info("patoolib extraction succeeded for {}", archive_path)
         return
     except ValueError:
         raise
     except Exception as exc:
-        logger.warning("patoolib failed ({}), falling back to 7z", exc)
-        _extract_with_7z(archive_path, dest, progress)
+        errors.append(f"patoolib: {exc}")
+
+    # Everything failed. Surface every tool's error — truncate each
+    # tool's message so the combined string stays within Telegram's
+    # 4096-char message limit.
+    combined = "; ".join(
+        f"[{e[:700]}{'...' if len(e) > 700 else ''}]" for e in errors
+    )
+    raise RuntimeError(
+        f"All extraction tools failed on this archive. Errors: {combined}"
+    )
 
 
 def _ext_kind(lower_path: str) -> Optional[str]:
@@ -665,110 +1166,300 @@ def _ext_kind(lower_path: str) -> Optional[str]:
     return None
 
 
-def _write_output_chunks(
-    cookies: Iterable[Tuple[str, str]],
+def _write_one_zip(
+    files: List[str],
     output_dir: str,
-    domains: Iterable[str],
+    domain: str,
+    part_idx: int,
+) -> str:
+    safe_domain = re.sub(r"[^A-Za-z0-9._-]", "_", domain)
+    if part_idx == 1:
+        zip_path = os.path.join(output_dir, f"{safe_domain}_cookies.zip")
+    else:
+        zip_path = os.path.join(output_dir, f"{safe_domain}_cookies_part{part_idx}.zip")
+    with zipfile.ZipFile(
+        zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+    ) as zf:
+        for src in files:
+            zf.write(src, arcname=os.path.basename(src))
+    return zip_path
+
+
+def _bundle_one_domain(
+    per_source_dir: str,
+    output_dir: str,
+    domain: str,
 ) -> List[str]:
+    """Bundle every per-source ``.txt`` in *per_source_dir* into one or
+    more chunked ``{domain}_cookies[_partN].zip`` files in *output_dir*.
+
+    Returns the list of zip files created (possibly empty)."""
+    entries: List[tuple[str, int]] = []
+    for name in sorted(os.listdir(per_source_dir)):
+        path = os.path.join(per_source_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            continue
+        if sz > 0:
+            entries.append((path, sz))
+
+    if not entries:
+        return []
+
+    limit = max(int(getattr(config, "OUTPUT_CHUNK_SIZE_BYTES", 45 * 1024 * 1024)), 1024)
+    zip_paths: List[str] = []
+    part_idx = 1
+    batch: List[str] = []
+    batch_size = 0
+    for path, sz in entries:
+        if batch and batch_size + sz > limit:
+            zip_paths.append(_write_one_zip(batch, output_dir, domain, part_idx))
+            part_idx += 1
+            batch = []
+            batch_size = 0
+        batch.append(path)
+        batch_size += sz
+    if batch:
+        zip_paths.append(_write_one_zip(batch, output_dir, domain, part_idx))
+    return zip_paths
+
+
+def _bundle_all_zips(
+    per_source_dir: str,
+    output_dir: str,
+    domain: Union[str, Iterable[str]],
+) -> List[str]:
+    """Bundle per-source ``.txt`` files into one zip per target domain.
+
+    *per_source_dir* may either be:
+
+    * a flat directory of ``.txt`` files (legacy single-domain layout) —
+      in which case all files are bundled into ``{domain}_cookies.zip``; or
+    * a directory containing one subdirectory per target domain (each
+      holding that domain's per-source ``.txt`` files) — in which case
+      one zip is produced per domain.
+
+    Returns the flat list of zip files created across every domain.
     """
-    Stream ``(target_domain, cookie_line)`` tuples into per-domain
-    ``<=OUTPUT_CHUNK_SIZE_BYTES`` chunk files. Each domain gets its own
-    independent chunk counter so output filenames look like
-    ``spotify.com_cookies_part1.txt``, ``netflix.com_cookies_part1.txt``…
+    domains = _coerce_domains(domain)
 
-    Returns the list of all output file paths created (across every domain).
+    # Detect layout: if any of the configured domains has a subdirectory
+    # under per_source_dir we treat this as the multi-domain layout. We
+    # also fall back to the legacy flat layout when only one domain is
+    # configured *and* there's no matching subdirectory — to keep older
+    # callers and tests behaving identically.
+    multi_layout = any(
+        os.path.isdir(os.path.join(per_source_dir, d)) for d in domains
+    )
+    if not multi_layout:
+        # Legacy layout — flat dir, single domain.
+        return _bundle_one_domain(per_source_dir, output_dir, domains[0])
+
+    zip_paths: List[str] = []
+    for d in domains:
+        sub = os.path.join(per_source_dir, d)
+        if not os.path.isdir(sub):
+            continue
+        zip_paths.extend(_bundle_one_domain(sub, output_dir, d))
+    return zip_paths
+
+
+def _run_extraction_zip_stream(
+    archive_path: str,
+    domain: Union[str, Iterable[str]],
+    progress: ExtractionProgress,
+    output_dir: str,
+    start: float,
+) -> ExtractionResult:
+    """Fast path for plain zip archives: walk members in place, scan
+    each one in memory, write per-source .txt files (one folder per
+    target domain) + bundle into one zip per domain.
+
+    Saves the disk-space + wall-clock cost of first unpacking the whole
+    archive to a temp dir, matching u.txt's ``extractZipStreaming`` idea.
     """
+    logger.info("Zip-streaming {} (no disk extraction)", archive_path)
+    progress.phase = "extracting"
+    progress.extract_start = time.monotonic()
+    progress.current_file = ""
 
-    domains = list(domains)
+    domains = _coerce_domains(domain)
 
-    @dataclass
-    class _Bucket:
-        domain: str
-        chunk_idx: int = 1
-        current_size: int = 0
-        fh: Optional["object"] = None  # type: ignore[type-arg]
-        path: str = ""
+    per_source_dir = tempfile.mkdtemp(
+        dir=str(config.TEMP_DIR), prefix="cookie_out_",
+    )
+    # One subdirectory per target domain so _bundle_all_zips can produce
+    # one zip per domain.
+    safe_targets: Dict[str, str] = {}
+    file_counters: Dict[str, int] = {}
+    for d in domains:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", d)
+        safe_targets[d] = safe
+        file_counters[d] = 1
+        os.makedirs(os.path.join(per_source_dir, d), exist_ok=True)
 
-    buckets: Dict[str, _Bucket] = {d: _Bucket(domain=d) for d in domains}
-    paths: List[str] = []
-
-    def _open_chunk(b: _Bucket) -> None:
-        b.path = os.path.join(
-            output_dir, f"{b.domain}_cookies_part{b.chunk_idx}.txt"
-        )
-        paths.append(b.path)
-        b.fh = open(b.path, "w", encoding="utf-8")
-        b.current_size = 0
+    cookie_parser = SmartCookieExtractor(domains)
+    per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
 
     try:
-        for target_domain, line in cookies:
-            b = buckets.get(target_domain)
-            if b is None:
-                # Unknown target — create a bucket on the fly so we never
-                # silently drop cookies.
-                b = _Bucket(domain=target_domain)
-                buckets[target_domain] = b
-            if b.fh is None:
-                _open_chunk(b)
-            encoded = line.encode("utf-8")
-            if (
-                b.current_size + len(encoded) > config.OUTPUT_CHUNK_SIZE_BYTES
-                and b.current_size > 0
-            ):
-                b.fh.close()  # type: ignore[union-attr]
-                b.chunk_idx += 1
-                _open_chunk(b)
-            b.fh.write(line)  # type: ignore[union-attr]
-            b.current_size += len(encoded)
-    finally:
-        for b in buckets.values():
-            if b.fh is not None:
+        try:
+            zf = zipfile.ZipFile(archive_path, "r")
+        except zipfile.BadZipFile as exc:
+            raise RuntimeError(f"Not a valid zip: {exc}") from exc
+
+        with zf:
+            members = [m for m in zf.infolist() if not m.is_dir()]
+            progress.extract_total = len(members)
+            progress.files_total = len(members)
+
+            # Switch to scanning phase straight away — we're doing
+            # extract+scan together, so there's no separate "extract
+            # to disk" step for the dashboard to render.
+            progress.phase = "scanning"
+
+            for member in members:
+                if progress.cancelled:
+                    break
+                progress.current_file = (
+                    os.path.basename(member.filename) or member.filename
+                )
+                progress.extract_current += 1
+
+                # Hard cap per-entry size so a corrupt zip bomb can't
+                # OOM us. Cookie txts are small — 64 MiB is generous.
+                if member.file_size and member.file_size > 64 * 1024 * 1024:
+                    progress.files_scanned += 1
+                    continue
+
                 try:
-                    b.fh.close()  # type: ignore[union-attr]
+                    with zf.open(member, "r") as fh:
+                        raw = fh.read()
+                except (RuntimeError, zipfile.BadZipFile, OSError):
+                    # RuntimeError from zipfile means encrypted entry —
+                    # we already probed and ruled that out, but just in
+                    # case skip silently instead of aborting the job.
+                    progress.files_scanned += 1
+                    continue
+
+                try:
+                    text = raw.decode("utf-8", errors="ignore")
                 except Exception:
-                    pass
+                    progress.files_scanned += 1
+                    continue
 
-    return paths
+                try:
+                    cookies = cookie_parser.extract_from_text(text)
+                except Exception:
+                    cookies = []
 
+                if cookies:
+                    # Group hits from this source file by target domain so
+                    # each target gets its own per-source ``akaza_*.txt``.
+                    by_target: Dict[str, List[Dict[str, str]]] = {}
+                    for c in cookies:
+                        t = c.get("target_domain", domains[0])
+                        by_target.setdefault(t, []).append(c)
+                    for t, group in by_target.items():
+                        safe = safe_targets.get(
+                            t, re.sub(r"[^A-Za-z0-9._-]", "_", t),
+                        )
+                        idx = file_counters.get(t, 1)
+                        out_name = f"akaza_{safe}_{idx}.txt"
+                        sub_dir = os.path.join(per_source_dir, t)
+                        os.makedirs(sub_dir, exist_ok=True)
+                        out_path = os.path.join(sub_dir, out_name)
+                        try:
+                            with open(out_path, "w", encoding="utf-8") as fh2:
+                                for c in group:
+                                    fh2.write(
+                                        f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
+                                        f"{c['secure']}\t{c['expiration']}\t"
+                                        f"{c['name']}\t{c['value']}\n"
+                                    )
+                                    progress.cookies_found += 1
+                                    per_domain_counts[t] = (
+                                        per_domain_counts.get(t, 0) + 1
+                                    )
+                            file_counters[t] = idx + 1
+                        except OSError:
+                            logger.exception(
+                                "Failed to write per-source file {}", out_path,
+                            )
 
-def _coerce_domains(domain: Union[str, Iterable[str]]) -> List[str]:
-    """Normalise the ``domain`` parameter into a non-empty list of domains."""
-    if isinstance(domain, str):
-        domains = [domain]
-    else:
-        domains = list(domain)
-    cleaned: List[str] = []
-    seen: set[str] = set()
-    for d in domains:
-        norm = d.lower().lstrip(".").strip()
-        if norm and norm not in seen:
-            seen.add(norm)
-            cleaned.append(norm)
-    if not cleaned:
-        raise ValueError("At least one domain must be provided")
-    return cleaned
+                progress.files_scanned += 1
+
+        progress.phase = "packaging"
+        progress.current_file = ""
+        output_files = _bundle_all_zips(per_source_dir, output_dir, domains)
+
+        output_files = [
+            p for p in output_files
+            if os.path.exists(p) and os.path.getsize(p) > 0
+        ]
+        duration = time.monotonic() - start
+
+        if progress.cancelled:
+            progress.phase = "cancelled"
+            return ExtractionResult(
+                success=bool(output_files),
+                output_files=output_files,
+                cookies_found=progress.cookies_found,
+                files_scanned=progress.files_scanned,
+                duration_seconds=duration,
+                partial=True,
+                error="" if output_files else "Cancelled by user (no cookies found yet)",
+                per_domain_counts=per_domain_counts,
+            )
+
+        progress.phase = "done"
+        return ExtractionResult(
+            success=True,
+            output_files=output_files,
+            cookies_found=progress.cookies_found,
+            files_scanned=progress.files_scanned,
+            duration_seconds=duration,
+            per_domain_counts=per_domain_counts,
+        )
+
+    finally:
+        shutil.rmtree(per_source_dir, ignore_errors=True)
 
 
 def _run_extraction(
     archive_path: str,
     domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
+    password: Optional[str] = None,
 ) -> ExtractionResult:
     """Blocking extraction — meant to run inside ``asyncio.to_thread``.
 
-    ``domain`` may be a single domain string (legacy) or any iterable of
-    domain strings. When multiple domains are supplied, each cookie file is
-    scanned once and matched cookies are routed to per-domain output files.
+    Accepts either a single domain string or an iterable of domains. When
+    multiple domains are configured the archive is scanned once and each
+    target gets its own ``{domain}_cookies[_partN].zip`` output bundle.
     """
     import time
 
     start = time.monotonic()
     domains = _coerce_domains(domain)
-    per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
     temp_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
     output_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
 
     try:
+        # Fast path: plain (non-encrypted) zip → stream-decompress each
+        # entry in memory and scan as we go, avoiding a full disk
+        # extraction. Mirrors u.txt's extractZipStreaming pattern.
+        if (
+            password is None
+            and _sniff_archive_type(archive_path) == "zip"
+            and not _probe_encrypted_entries(archive_path)
+        ):
+            return _run_extraction_zip_stream(
+                archive_path, domains, progress, output_dir, start,
+            )
+
         # Phase 1: extract archive
         progress.phase = "extracting"
         progress.extract_start = time.monotonic()
@@ -777,7 +1468,7 @@ def _run_extraction(
             "Extracting archive {} into {} for domains={}",
             archive_path, temp_dir, domains,
         )
-        _extract_archive(archive_path, temp_dir, progress)
+        _extract_archive(archive_path, temp_dir, progress, password=password)
 
         if progress.cancelled:
             # Nothing useful to send if the user cancelled mid-extraction.
@@ -786,10 +1477,12 @@ def _run_extraction(
                 error="Cancelled by user before any files were scanned",
                 duration_seconds=time.monotonic() - start,
                 partial=True,
-                per_domain_counts=per_domain_counts,
             )
 
-        # Phase 2: scan files
+        # Phase 2: scan files. Mirrors the reference layout from
+        # ``log to cookie.py``: one .txt per source file that yielded
+        # matching cookies, named ``akaza_{domain}_{counter}.txt`` and
+        # then bundled into one zip per target domain.
         progress.phase = "scanning"
         extractor = SmartCookieExtractor(domains)
 
@@ -799,38 +1492,69 @@ def _run_extraction(
                 all_files.append(os.path.join(root, fname))
         progress.files_total = len(all_files)
 
-        def _cookie_generator() -> Generator[Tuple[str, str], None, None]:
-            for fpath in all_files:
-                if progress.cancelled:
-                    # Stop the generator cleanly so any cookies already
-                    # written to the current chunk file are flushed by
-                    # _write_output_chunks' final fh.close().
-                    return
-                progress.current_file = os.path.basename(fpath)
-                try:
-                    cookies = extractor.extract_from_file(fpath)
-                    for c in cookies:
-                        target = c.get("target_domain", domains[0])
-                        line = (
-                            f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
-                            f"{c['secure']}\t{c['expiration']}\t"
-                            f"{c['name']}\t{c['value']}\n"
-                        )
-                        per_domain_counts[target] = (
-                            per_domain_counts.get(target, 0) + 1
-                        )
-                        progress.cookies_found += 1
-                        yield target, line
-                except Exception:
-                    pass
-                progress.files_scanned += 1
-
-        output_files = _write_output_chunks(
-            _cookie_generator(), output_dir, domains,
+        per_source_dir = tempfile.mkdtemp(
+            dir=str(config.TEMP_DIR), prefix="cookie_out_"
         )
+        safe_targets: Dict[str, str] = {
+            d: re.sub(r"[^A-Za-z0-9._-]", "_", d) for d in domains
+        }
+        file_counters: Dict[str, int] = {d: 1 for d in domains}
+        per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
+        for d in domains:
+            os.makedirs(os.path.join(per_source_dir, d), exist_ok=True)
 
-        # Drop empty chunk files (e.g. cancelled before any cookie was found,
-        # or domains that simply matched zero cookies).
+        for fpath in all_files:
+            if progress.cancelled:
+                break
+            progress.current_file = os.path.basename(fpath)
+            try:
+                cookies = extractor.extract_from_file(fpath)
+            except Exception:
+                cookies = []
+            if cookies:
+                # Group by target domain so each gets its own per-source
+                # ``akaza_*.txt`` file.
+                by_target: Dict[str, List[Dict[str, str]]] = {}
+                for c in cookies:
+                    t = c.get("target_domain", domains[0])
+                    by_target.setdefault(t, []).append(c)
+                for t, group in by_target.items():
+                    safe = safe_targets.get(
+                        t, re.sub(r"[^A-Za-z0-9._-]", "_", t),
+                    )
+                    idx = file_counters.get(t, 1)
+                    out_name = f"akaza_{safe}_{idx}.txt"
+                    sub_dir = os.path.join(per_source_dir, t)
+                    os.makedirs(sub_dir, exist_ok=True)
+                    out_path = os.path.join(sub_dir, out_name)
+                    try:
+                        with open(out_path, "w", encoding="utf-8") as fh:
+                            for c in group:
+                                fh.write(
+                                    f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
+                                    f"{c['secure']}\t{c['expiration']}\t"
+                                    f"{c['name']}\t{c['value']}\n"
+                                )
+                                progress.cookies_found += 1
+                                per_domain_counts[t] = (
+                                    per_domain_counts.get(t, 0) + 1
+                                )
+                        file_counters[t] = idx + 1
+                    except OSError:
+                        logger.exception(
+                            "Failed to write per-source file {}", out_path,
+                        )
+            progress.files_scanned += 1
+
+        # Phase 3: bundle per-source .txt files into one zip per domain.
+        progress.phase = "packaging"
+        progress.current_file = ""
+        output_files = _bundle_all_zips(per_source_dir, output_dir, domains)
+
+        # The per-source temp dir is no longer needed once zipped.
+        shutil.rmtree(per_source_dir, ignore_errors=True)
+
+        # Drop empty zip files (shouldn't happen, but belt-and-braces).
         output_files = [
             p for p in output_files
             if os.path.exists(p) and os.path.getsize(p) > 0
@@ -868,7 +1592,6 @@ def _run_extraction(
             success=False,
             error=str(exc),
             duration_seconds=time.monotonic() - start,
-            per_domain_counts=per_domain_counts,
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -879,10 +1602,24 @@ async def run_extraction_async(
     archive_path: str,
     domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
+    password: Optional[str] = None,
 ) -> ExtractionResult:
     """Non-blocking facade — offloads heavy work to a thread.
 
-    ``domain`` may be either a single domain string (legacy callers) or an
-    iterable of domain strings (multi-domain callers).
+    *domain* may be either a single domain string or an iterable of
+    domain strings; in the multi-domain case each target gets its own
+    output zip.
     """
-    return await asyncio.to_thread(_run_extraction, archive_path, domain, progress)
+    return await asyncio.to_thread(
+        _run_extraction, archive_path, domain, progress, password
+    )
+
+
+async def probe_encrypted_entries_async(archive_path: str) -> List[str]:
+    """Async wrapper around ``_probe_encrypted_entries``."""
+    return await asyncio.to_thread(_probe_encrypted_entries, archive_path)
+
+
+async def guess_archive_password_async(archive_path: str) -> Optional[str]:
+    """Async wrapper around :func:`guess_archive_password`."""
+    return await asyncio.to_thread(guess_archive_password, archive_path)
