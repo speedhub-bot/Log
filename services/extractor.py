@@ -19,7 +19,7 @@ import threading
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Generator, List, Optional
+from typing import Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 from loguru import logger
 
@@ -27,33 +27,65 @@ import config
 
 
 # ════════════════════════════════════════════════════════════
-#  SmartCookieExtractor  — REUSED EXACTLY AS-IS
+#  SmartCookieExtractor
 # ════════════════════════════════════════════════════════════
 
 class SmartCookieExtractor:
-    """Efficiently extracts cookies from Netscape cookie format files"""
+    """Efficiently extracts cookies from Netscape cookie format files.
 
-    def __init__(self, domain: str, patterns: Optional[List[str]] = None):
+    Supports filtering against a single target domain or multiple target
+    domains in a single pass. When multiple domains are provided each cookie
+    line is matched against every target and routed to the first matching
+    target via :meth:`match_domain`.
+    """
+
+    def __init__(
+        self,
+        domain: Union[str, Iterable[str]],
+        patterns: Optional[List[str]] = None,
+    ):
         """
         Initialize extractor
 
         Args:
-            domain: Domain to filter cookies (e.g., 'spotify.com')
-            patterns: Optional regex patterns for additional filtering
+            domain: A single domain (e.g. ``'spotify.com'``) or an iterable of
+                domains (e.g. ``['spotify.com', 'netflix.com']``) to filter
+                cookies against.
+            patterns: Optional regex patterns for additional filtering.
         """
-        self.domain = domain.lower()
+        if isinstance(domain, str):
+            domains: List[str] = [domain]
+        else:
+            domains = list(domain)
+
+        # Normalise: lower-case, strip leading dots, drop empties, dedupe.
+        seen: set[str] = set()
+        cleaned: List[str] = []
+        for d in domains:
+            norm = d.lower().lstrip(".").strip()
+            if norm and norm not in seen:
+                seen.add(norm)
+                cleaned.append(norm)
+        if not cleaned:
+            raise ValueError("SmartCookieExtractor requires at least one domain")
+
+        self.domains: List[str] = cleaned
+        # Back-compat: single-domain callers still read ``.domain``.
+        self.domain: str = cleaned[0]
         self.patterns = patterns or []
-        self.domain_pattern = re.compile(rf"({re.escape(self.domain)})", re.IGNORECASE)
+        self.domain_pattern = re.compile(
+            "(" + "|".join(re.escape(d) for d in cleaned) + ")",
+            re.IGNORECASE,
+        )
 
     def extract_from_file(self, filepath: str) -> List[Dict[str, str]]:
         """
-        Extract cookies from Netscape format cookie file
+        Extract cookies from a Netscape cookie format file.
 
-        Args:
-            filepath: Path to cookie file
-
-        Returns:
-            List of cookie dictionaries
+        Returns a flat list of cookie dicts that match *any* configured
+        target domain. The matched target is recorded in each dict's
+        ``target_domain`` key so callers routing per-domain output do not
+        have to recompute matches.
         """
         results: List[Dict[str, str]] = []
         fp = Path(filepath)
@@ -70,7 +102,11 @@ class SmartCookieExtractor:
                     continue
 
                 cookie = self.parse_cookie_line(line)
-                if cookie and self._matches_domain(cookie["domain"]):
+                if cookie is None:
+                    continue
+                target = self.match_domain(cookie["domain"])
+                if target is not None:
+                    cookie["target_domain"] = target
                     results.append(cookie)
 
         return results
@@ -104,17 +140,30 @@ class SmartCookieExtractor:
         except Exception:
             return None
 
-    def _matches_domain(self, cookie_domain: str) -> bool:
-        """Check if cookie domain matches the target domain"""
-        cookie_domain = cookie_domain.lower().lstrip(".")
-        target_domain = self.domain.lstrip(".")
+    def match_domain(self, cookie_domain: str) -> Optional[str]:
+        """Return the configured target domain that matches *cookie_domain*.
 
-        # Exact match or subdomain match
-        return (
-            cookie_domain == target_domain
-            or cookie_domain.endswith("." + target_domain)
-            or target_domain.endswith("." + cookie_domain)
-        )
+        Match rules (per target):
+          * exact match, or
+          * cookie domain is a subdomain of the target, or
+          * target is a subdomain of the cookie domain (legacy permissive
+            behaviour preserved from the original single-domain extractor).
+
+        Returns ``None`` when no configured target matches.
+        """
+        cookie_domain = cookie_domain.lower().lstrip(".")
+        for target in self.domains:
+            if (
+                cookie_domain == target
+                or cookie_domain.endswith("." + target)
+                or target.endswith("." + cookie_domain)
+            ):
+                return target
+        return None
+
+    def _matches_domain(self, cookie_domain: str) -> bool:
+        """Back-compat alias used by older callers."""
+        return self.match_domain(cookie_domain) is not None
 
     def extract_from_directory(
         self,
@@ -139,11 +188,14 @@ class SmartCookieExtractor:
         if not dir_path.exists():
             raise FileNotFoundError(f"Directory not found: {dir_path}")
 
-        # Setup output directory structure if real-time saving
-        domain_output_dir: Optional[Path] = None
+        # When real-time saving is enabled, create one sub-directory per
+        # configured target domain so output stays cleanly partitioned.
+        domain_output_dirs: Dict[str, Path] = {}
         if realtime_save and output_dir:
-            domain_output_dir = Path(output_dir) / self.domain
-            domain_output_dir.mkdir(parents=True, exist_ok=True)
+            for d in self.domains:
+                p = Path(output_dir) / d
+                p.mkdir(parents=True, exist_ok=True)
+                domain_output_dirs[d] = p
 
         # Find all .txt files in Cookies subdirectories
         cookie_files: List[Path] = []
@@ -159,26 +211,36 @@ class SmartCookieExtractor:
             except Exception:
                 pass
 
-        file_counter = 1
-        for i, filepath in enumerate(cookie_files, 1):
+        file_counters: Dict[str, int] = {d: 1 for d in self.domains}
+        for filepath in cookie_files:
             try:
                 cookies = self.extract_from_file(str(filepath))
-                if cookies:
-                    results[str(filepath)] = cookies
+                if not cookies:
+                    continue
+                results[str(filepath)] = cookies
 
-                    if realtime_save and domain_output_dir:
-                        output_filename = f"akaza_{self.domain}_{file_counter}.txt"
-                        output_path = domain_output_dir / output_filename
+                if not (realtime_save and domain_output_dirs):
+                    continue
 
-                        with open(output_path, "w", encoding="utf-8") as f:
-                            for cookie in cookies:
-                                f.write(
-                                    f"{cookie['domain']}\t{cookie['flag']}\t{cookie['path']}\t"
-                                    f"{cookie['secure']}\t{cookie['expiration']}\t"
-                                    f"{cookie['name']}\t{cookie['value']}\n"
-                                )
+                # Group cookies by their matched target domain.
+                grouped: Dict[str, List[Dict[str, str]]] = {}
+                for c in cookies:
+                    grouped.setdefault(c["target_domain"], []).append(c)
 
-                        file_counter += 1
+                for target, items in grouped.items():
+                    out_dir = domain_output_dirs.get(target)
+                    if out_dir is None:
+                        continue
+                    idx = file_counters[target]
+                    output_path = out_dir / f"akaza_{target}_{idx}.txt"
+                    with open(output_path, "w", encoding="utf-8") as f:
+                        for cookie in items:
+                            f.write(
+                                f"{cookie['domain']}\t{cookie['flag']}\t{cookie['path']}\t"
+                                f"{cookie['secure']}\t{cookie['expiration']}\t"
+                                f"{cookie['name']}\t{cookie['value']}\n"
+                            )
+                    file_counters[target] = idx + 1
             except Exception:
                 pass
 
@@ -216,6 +278,9 @@ class ExtractionResult:
     error: str = ""
     duration_seconds: float = 0.0
     partial: bool = False           # True when results came from a cancelled job
+    # Per-target-domain cookie counts. Empty for legacy single-domain callers
+    # that don't care about the breakdown.
+    per_domain_counts: Dict[str, int] = field(default_factory=dict)
 
 
 def _safe_zip_extract(
@@ -601,46 +666,105 @@ def _ext_kind(lower_path: str) -> Optional[str]:
 
 
 def _write_output_chunks(
-    cookies: Generator[str, None, None],
+    cookies: Iterable[Tuple[str, str]],
     output_dir: str,
-    domain: str,
+    domains: Iterable[str],
 ) -> List[str]:
     """
-    Stream cookie lines into <=45 MB chunk files.
-    Returns list of output file paths.
+    Stream ``(target_domain, cookie_line)`` tuples into per-domain
+    ``<=OUTPUT_CHUNK_SIZE_BYTES`` chunk files. Each domain gets its own
+    independent chunk counter so output filenames look like
+    ``spotify.com_cookies_part1.txt``, ``netflix.com_cookies_part1.txt``…
+
+    Returns the list of all output file paths created (across every domain).
     """
-    chunk_idx = 1
-    current_size = 0
+
+    domains = list(domains)
+
+    @dataclass
+    class _Bucket:
+        domain: str
+        chunk_idx: int = 1
+        current_size: int = 0
+        fh: Optional["object"] = None  # type: ignore[type-arg]
+        path: str = ""
+
+    buckets: Dict[str, _Bucket] = {d: _Bucket(domain=d) for d in domains}
     paths: List[str] = []
 
-    def _open_chunk() -> "tuple[str, object]":
-        p = os.path.join(output_dir, f"{domain}_cookies_part{chunk_idx}.txt")
-        paths.append(p)
-        return p, open(p, "w", encoding="utf-8")
+    def _open_chunk(b: _Bucket) -> None:
+        b.path = os.path.join(
+            output_dir, f"{b.domain}_cookies_part{b.chunk_idx}.txt"
+        )
+        paths.append(b.path)
+        b.fh = open(b.path, "w", encoding="utf-8")
+        b.current_size = 0
 
-    path, fh = _open_chunk()
-    for line in cookies:
-        encoded = line.encode("utf-8")
-        if current_size + len(encoded) > config.OUTPUT_CHUNK_SIZE_BYTES and current_size > 0:
-            fh.close()  # type: ignore[union-attr]
-            chunk_idx += 1
-            current_size = 0
-            path, fh = _open_chunk()
-        fh.write(line)  # type: ignore[union-attr]
-        current_size += len(encoded)
-    fh.close()  # type: ignore[union-attr]
+    try:
+        for target_domain, line in cookies:
+            b = buckets.get(target_domain)
+            if b is None:
+                # Unknown target — create a bucket on the fly so we never
+                # silently drop cookies.
+                b = _Bucket(domain=target_domain)
+                buckets[target_domain] = b
+            if b.fh is None:
+                _open_chunk(b)
+            encoded = line.encode("utf-8")
+            if (
+                b.current_size + len(encoded) > config.OUTPUT_CHUNK_SIZE_BYTES
+                and b.current_size > 0
+            ):
+                b.fh.close()  # type: ignore[union-attr]
+                b.chunk_idx += 1
+                _open_chunk(b)
+            b.fh.write(line)  # type: ignore[union-attr]
+            b.current_size += len(encoded)
+    finally:
+        for b in buckets.values():
+            if b.fh is not None:
+                try:
+                    b.fh.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+
     return paths
+
+
+def _coerce_domains(domain: Union[str, Iterable[str]]) -> List[str]:
+    """Normalise the ``domain`` parameter into a non-empty list of domains."""
+    if isinstance(domain, str):
+        domains = [domain]
+    else:
+        domains = list(domain)
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for d in domains:
+        norm = d.lower().lstrip(".").strip()
+        if norm and norm not in seen:
+            seen.add(norm)
+            cleaned.append(norm)
+    if not cleaned:
+        raise ValueError("At least one domain must be provided")
+    return cleaned
 
 
 def _run_extraction(
     archive_path: str,
-    domain: str,
+    domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
 ) -> ExtractionResult:
-    """Blocking extraction — meant to run inside ``asyncio.to_thread``."""
+    """Blocking extraction — meant to run inside ``asyncio.to_thread``.
+
+    ``domain`` may be a single domain string (legacy) or any iterable of
+    domain strings. When multiple domains are supplied, each cookie file is
+    scanned once and matched cookies are routed to per-domain output files.
+    """
     import time
 
     start = time.monotonic()
+    domains = _coerce_domains(domain)
+    per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
     temp_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
     output_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
 
@@ -649,7 +773,10 @@ def _run_extraction(
         progress.phase = "extracting"
         progress.extract_start = time.monotonic()
         progress.current_file = ""
-        logger.info("Extracting archive {} into {}", archive_path, temp_dir)
+        logger.info(
+            "Extracting archive {} into {} for domains={}",
+            archive_path, temp_dir, domains,
+        )
         _extract_archive(archive_path, temp_dir, progress)
 
         if progress.cancelled:
@@ -659,11 +786,12 @@ def _run_extraction(
                 error="Cancelled by user before any files were scanned",
                 duration_seconds=time.monotonic() - start,
                 partial=True,
+                per_domain_counts=per_domain_counts,
             )
 
         # Phase 2: scan files
         progress.phase = "scanning"
-        extractor = SmartCookieExtractor(domain)
+        extractor = SmartCookieExtractor(domains)
 
         all_files: List[str] = []
         for root, _dirs, files in os.walk(temp_dir):
@@ -671,7 +799,7 @@ def _run_extraction(
                 all_files.append(os.path.join(root, fname))
         progress.files_total = len(all_files)
 
-        def _cookie_generator() -> Generator[str, None, None]:
+        def _cookie_generator() -> Generator[Tuple[str, str], None, None]:
             for fpath in all_files:
                 if progress.cancelled:
                     # Stop the generator cleanly so any cookies already
@@ -682,19 +810,27 @@ def _run_extraction(
                 try:
                     cookies = extractor.extract_from_file(fpath)
                     for c in cookies:
-                        yield (
+                        target = c.get("target_domain", domains[0])
+                        line = (
                             f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
                             f"{c['secure']}\t{c['expiration']}\t"
                             f"{c['name']}\t{c['value']}\n"
                         )
+                        per_domain_counts[target] = (
+                            per_domain_counts.get(target, 0) + 1
+                        )
                         progress.cookies_found += 1
+                        yield target, line
                 except Exception:
                     pass
                 progress.files_scanned += 1
 
-        output_files = _write_output_chunks(_cookie_generator(), output_dir, domain)
+        output_files = _write_output_chunks(
+            _cookie_generator(), output_dir, domains,
+        )
 
-        # Drop empty chunk files (e.g. cancelled before any cookie was found).
+        # Drop empty chunk files (e.g. cancelled before any cookie was found,
+        # or domains that simply matched zero cookies).
         output_files = [
             p for p in output_files
             if os.path.exists(p) and os.path.getsize(p) > 0
@@ -712,6 +848,7 @@ def _run_extraction(
                 duration_seconds=duration,
                 partial=True,
                 error="" if output_files else "Cancelled by user (no cookies found yet)",
+                per_domain_counts=per_domain_counts,
             )
 
         progress.phase = "done"
@@ -721,6 +858,7 @@ def _run_extraction(
             cookies_found=progress.cookies_found,
             files_scanned=progress.files_scanned,
             duration_seconds=duration,
+            per_domain_counts=per_domain_counts,
         )
 
     except Exception as exc:
@@ -730,6 +868,7 @@ def _run_extraction(
             success=False,
             error=str(exc),
             duration_seconds=time.monotonic() - start,
+            per_domain_counts=per_domain_counts,
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -738,8 +877,12 @@ def _run_extraction(
 
 async def run_extraction_async(
     archive_path: str,
-    domain: str,
+    domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
 ) -> ExtractionResult:
-    """Non-blocking facade — offloads heavy work to a thread."""
+    """Non-blocking facade — offloads heavy work to a thread.
+
+    ``domain`` may be either a single domain string (legacy callers) or an
+    iterable of domain strings (multi-domain callers).
+    """
     return await asyncio.to_thread(_run_extraction, archive_path, domain, progress)
