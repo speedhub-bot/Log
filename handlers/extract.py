@@ -40,7 +40,7 @@ from services.extractor import (
 )
 from services.queue import JobQueue, QueueItem
 from utils.formatting import bytes_human, progress_bar, seconds_human, time_until
-from utils.validators import validate_archive, validate_domain
+from utils.validators import validate_archive, validate_domains
 
 # Conversation states
 DOMAIN, FILE = range(2)
@@ -118,8 +118,12 @@ async def extract_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     text = (
-        "\U0001f310 Enter the domain to extract cookies for:\n"
-        "Example: spotify.com, netflix.com"
+        "\U0001f310 Enter one or more domains to extract cookies for.\n"
+        f"Up to {config.MAX_DOMAINS_PER_EXTRACT} domains, separated by commas, "
+        "spaces or new lines.\n\n"
+        "Examples:\n"
+        "  spotify.com\n"
+        "  spotify.com, netflix.com, crunchyroll.com"
     )
     if update.callback_query:
         await update.callback_query.answer()
@@ -131,25 +135,36 @@ async def extract_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 # ── State: DOMAIN ──────────────────────────────────────────
 async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Validate domain and move to FILE state."""
+    """Validate one or more domains and move to FILE state."""
     user = update.effective_user
     if user is None or update.message is None:
         return ConversationHandler.END
 
     raw = (update.message.text or "").strip()
-    valid, result = validate_domain(raw)
+    valid, result = validate_domains(raw, max_count=config.MAX_DOMAINS_PER_EXTRACT)
     if not valid:
-        await update.message.reply_text(f"\u274c {result}", reply_markup=_cancel_kb())
-        return DOMAIN
-
-    # Check blacklist
-    if await db.is_domain_blacklisted(result):
+        # ``result`` is the error string in the failure branch.
         await update.message.reply_text(
-            "\u274c This domain is blacklisted.", reply_markup=_cancel_kb()
+            f"\u274c {result}", reply_markup=_cancel_kb(),
         )
         return DOMAIN
 
-    context.user_data["extract_domain"] = result  # type: ignore[index]
+    domains: list[str] = result  # type: ignore[assignment]
+
+    # Check blacklist for each domain.
+    for d in domains:
+        if await db.is_domain_blacklisted(d):
+            await update.message.reply_text(
+                f"\u274c Domain is blacklisted: {d}",
+                reply_markup=_cancel_kb(),
+            )
+            return DOMAIN
+
+    context.user_data["extract_domains"] = domains  # type: ignore[index]
+    # Back-compat: keep the legacy single-domain key populated with the
+    # first/primary domain so any code that still reads it keeps working
+    # (e.g. older logging hooks).
+    context.user_data["extract_domain"] = domains[0]  # type: ignore[index]
 
     is_admin = user.id == config.ADMIN_ID
     remaining = await db.get_remaining_quota(user.id)
@@ -165,7 +180,16 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         max_file = "2 GB"
 
+    if len(domains) == 1:
+        domain_line = f"\U0001f310 Domain: {domains[0]}"
+    else:
+        domain_line = (
+            f"\U0001f310 Domains ({len(domains)}): "
+            + ", ".join(domains)
+        )
+
     text = (
+        f"{domain_line}\n"
         f"\U0001f4c1 Now send your archive file — OR paste a direct "
         f"download URL (.zip / .rar).\n"
         f"Supported: .zip .rar .7z .tar.gz\n"
@@ -229,14 +253,24 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             )
             return ConversationHandler.END
 
-    domain = context.user_data.get("extract_domain", "unknown")  # type: ignore[union-attr]
+    domains: list[str] = context.user_data.get(  # type: ignore[union-attr]
+        "extract_domains",
+        [context.user_data.get("extract_domain", "unknown")],  # type: ignore[union-attr]
+    )
+    if not domains:
+        domains = ["unknown"]
+    # Comma-joined string is what we persist in the DB ``jobs.domain`` column
+    # and what we display back to the user in legacy summaries.
+    domain_label = ", ".join(domains)
 
     # Consume quota (no-op for admin)
     if not is_admin:
         await db.consume_quota(user.id, file_size)
 
     # Create DB job
-    job_id = await db.create_job(user.id, domain, doc.file_name or "archive", file_size)
+    job_id = await db.create_job(
+        user.id, domain_label, doc.file_name or "archive", file_size,
+    )
 
     # Send initial progress message
     progress_msg = await update.message.reply_text(
@@ -252,7 +286,7 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     async def _worker() -> None:
         await _process_job(
-            update, context, job_id, user.id, domain,
+            update, context, job_id, user.id, domains,
             source_ref, progress_msg, progress,
         )
 
@@ -307,12 +341,18 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     is_admin = user.id == config.ADMIN_ID
     vip = await db.is_vip(user.id)
-    domain = context.user_data.get("extract_domain", "unknown")  # type: ignore[union-attr]
+    domains: list[str] = context.user_data.get(  # type: ignore[union-attr]
+        "extract_domains",
+        [context.user_data.get("extract_domain", "unknown")],  # type: ignore[union-attr]
+    )
+    if not domains:
+        domains = ["unknown"]
+    domain_label = ", ".join(domains)
 
     # Assume unknown size for URLs; the worker will enforce caps against
     # the real content-length it sees during download.
     file_name = raw.split("?")[0].rstrip("/").split("/")[-1] or "archive"
-    job_id = await db.create_job(user.id, domain, file_name, 0)
+    job_id = await db.create_job(user.id, domain_label, file_name, 0)
 
     progress_msg = await update.message.reply_text(
         "\u23f3 Queued for download...",
@@ -324,7 +364,7 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     async def _worker() -> None:
         await _process_job(
-            update, context, job_id, user.id, domain,
+            update, context, job_id, user.id, domains,
             ("url", raw, file_name), progress_msg, progress,
         )
 
@@ -352,7 +392,7 @@ async def _process_job(
     context: ContextTypes.DEFAULT_TYPE,
     job_id: int,
     user_id: int,
-    domain: str,
+    domains: list[str],
     original_msg,
     progress_msg,
     progress: ExtractionProgress,
@@ -361,6 +401,7 @@ async def _process_job(
     start_ts = time.monotonic()
     temp_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
     result = None  # set before try so finally can reference it safely
+    domain_label = ", ".join(domains) if domains else "unknown"
 
     try:
         await db.update_job(job_id, status="processing", started_at=db._now())
@@ -388,9 +429,10 @@ async def _process_job(
             context, user_id, archive_path, progress_msg, job_id,
         )
 
-        # Extract
+        # Extract — run_extraction_async accepts a single domain string
+        # or a list of domains for multi-target jobs.
         result = await run_extraction_async(
-            archive_path, domain, progress, password=password,
+            archive_path, domains, progress, password=password,
         )
 
         updater_task.cancel()
@@ -464,9 +506,19 @@ async def _process_job(
             "\u26a0\ufe0f Cancelled \u2014 partial results delivered"
             if result.partial else "\u2705 Extraction Complete!"
         )
+        if len(domains) == 1:
+            domain_lines = f"\U0001f310 Domain: {domains[0]}\n"
+        else:
+            domain_lines = (
+                f"\U0001f310 Domains ({len(domains)}): "
+                f"{', '.join(domains)}\n"
+            )
+            counts = result.per_domain_counts or {}
+            for d in domains:
+                domain_lines += f"   \u2022 {d}: {counts.get(d, 0):,}\n"
         summary = (
             f"{header}\n\n"
-            f"\U0001f310 Domain: {domain}\n"
+            f"{domain_lines}"
             f"\U0001f36a Cookies found: {result.cookies_found:,}\n"
             f"\U0001f4c1 Files scanned: {result.files_scanned:,}\n"
             f"\U0001f4e6 Archive size: {bytes_human(file_size)}\n"

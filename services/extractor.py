@@ -20,7 +20,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Union
 
 from loguru import logger
 
@@ -31,20 +31,61 @@ import config
 #  SmartCookieExtractor  — REUSED EXACTLY AS-IS
 # ════════════════════════════════════════════════════════════
 
-class SmartCookieExtractor:
-    """Efficiently extracts cookies from Netscape cookie format files"""
+def _coerce_domains(domain: Union[str, Iterable[str]]) -> List[str]:
+    """Normalise *domain* into a deduplicated list of lowercase domains.
 
-    def __init__(self, domain: str, patterns: Optional[List[str]] = None):
-        """
-        Initialize extractor
+    Accepts a single string or any iterable of strings. Empty / blank
+    entries and leading dots are stripped. Order is preserved.
+    """
+    if isinstance(domain, str):
+        candidates = [domain]
+    else:
+        candidates = list(domain)
+    cleaned: List[str] = []
+    seen = set()
+    for d in candidates:
+        if not isinstance(d, str):
+            continue
+        norm = d.strip().lower().lstrip(".")
+        if norm and norm not in seen:
+            seen.add(norm)
+            cleaned.append(norm)
+    return cleaned
+
+
+class SmartCookieExtractor:
+    """Efficiently extracts cookies from Netscape cookie format files.
+
+    Supports filtering against a single target domain or multiple target
+    domains in a single pass. When multiple domains are provided each cookie
+    dict is tagged with a ``target_domain`` key naming whichever configured
+    domain it matched, so callers can route per-domain without rerunning
+    the parse.
+    """
+
+    def __init__(
+        self,
+        domain: Union[str, Iterable[str]],
+        patterns: Optional[List[str]] = None,
+    ):
+        """Initialise extractor.
 
         Args:
-            domain: Domain to filter cookies (e.g., 'spotify.com')
-            patterns: Optional regex patterns for additional filtering
+            domain: A single domain string (e.g. ``"spotify.com"``) or an
+                iterable of domain strings to filter against.
+            patterns: Optional regex patterns for additional filtering.
         """
-        self.domain = domain.lower()
+        domains = _coerce_domains(domain)
+        if not domains:
+            raise ValueError("SmartCookieExtractor requires at least one domain")
+        self.domains: List[str] = domains
+        # Back-compat: single ``self.domain`` attr keeps pointing at the
+        # primary (first) target so older callers keep working.
+        self.domain: str = domains[0]
         self.patterns = patterns or []
-        self.domain_pattern = re.compile(rf"({re.escape(self.domain)})", re.IGNORECASE)
+        self.domain_pattern = re.compile(
+            rf"({re.escape(self.domain)})", re.IGNORECASE,
+        )
 
     def extract_from_file(self, filepath: str) -> List[Dict[str, str]]:
         """
@@ -74,7 +115,11 @@ class SmartCookieExtractor:
             if not line or line.startswith("#"):
                 continue
             cookie = self.parse_cookie_line(line)
-            if cookie and self._matches_domain(cookie["domain"]):
+            if cookie is None:
+                continue
+            target = self.match_domain(cookie["domain"])
+            if target is not None:
+                cookie["target_domain"] = target
                 results.append(cookie)
         return results
 
@@ -107,17 +152,30 @@ class SmartCookieExtractor:
         except Exception:
             return None
 
-    def _matches_domain(self, cookie_domain: str) -> bool:
-        """Check if cookie domain matches the target domain"""
-        cookie_domain = cookie_domain.lower().lstrip(".")
-        target_domain = self.domain.lstrip(".")
+    def match_domain(self, cookie_domain: str) -> Optional[str]:
+        """Return the configured target domain that matches *cookie_domain*.
 
-        # Exact match or subdomain match
-        return (
-            cookie_domain == target_domain
-            or cookie_domain.endswith("." + target_domain)
-            or target_domain.endswith("." + cookie_domain)
-        )
+        Match rules (per configured target):
+          * exact match, or
+          * cookie domain is a subdomain of the target, or
+          * target is a subdomain of the cookie domain (legacy permissive
+            behaviour preserved from the original single-domain extractor).
+
+        Returns ``None`` when no configured target matches.
+        """
+        cookie_domain = cookie_domain.lower().lstrip(".")
+        for target in self.domains:
+            if (
+                cookie_domain == target
+                or cookie_domain.endswith("." + target)
+                or target.endswith("." + cookie_domain)
+            ):
+                return target
+        return None
+
+    def _matches_domain(self, cookie_domain: str) -> bool:
+        """Back-compat alias used by older single-domain callers."""
+        return self.match_domain(cookie_domain) is not None
 
     def extract_from_directory(
         self,
@@ -219,6 +277,10 @@ class ExtractionResult:
     error: str = ""
     duration_seconds: float = 0.0
     partial: bool = False           # True when results came from a cancelled job
+    # Per-target-domain cookie counts. Only populated when the extractor
+    # was configured for one or more domains; keys are the cleaned target
+    # domain strings.
+    per_domain_counts: Dict[str, int] = field(default_factory=dict)
 
 
 def _safe_zip_extract(
@@ -1123,13 +1185,15 @@ def _write_one_zip(
     return zip_path
 
 
-def _bundle_all_zips(
+def _bundle_one_domain(
     per_source_dir: str,
     output_dir: str,
     domain: str,
 ) -> List[str]:
-    """Like ``_bundle_per_source_txts_into_zip`` but returns the full
-    list of zip files (one or many parts)."""
+    """Bundle every per-source ``.txt`` in *per_source_dir* into one or
+    more chunked ``{domain}_cookies[_partN].zip`` files in *output_dir*.
+
+    Returns the list of zip files created (possibly empty)."""
     entries: List[tuple[str, int]] = []
     for name in sorted(os.listdir(per_source_dir)):
         path = os.path.join(per_source_dir, name)
@@ -1163,15 +1227,56 @@ def _bundle_all_zips(
     return zip_paths
 
 
+def _bundle_all_zips(
+    per_source_dir: str,
+    output_dir: str,
+    domain: Union[str, Iterable[str]],
+) -> List[str]:
+    """Bundle per-source ``.txt`` files into one zip per target domain.
+
+    *per_source_dir* may either be:
+
+    * a flat directory of ``.txt`` files (legacy single-domain layout) —
+      in which case all files are bundled into ``{domain}_cookies.zip``; or
+    * a directory containing one subdirectory per target domain (each
+      holding that domain's per-source ``.txt`` files) — in which case
+      one zip is produced per domain.
+
+    Returns the flat list of zip files created across every domain.
+    """
+    domains = _coerce_domains(domain)
+
+    # Detect layout: if any of the configured domains has a subdirectory
+    # under per_source_dir we treat this as the multi-domain layout. We
+    # also fall back to the legacy flat layout when only one domain is
+    # configured *and* there's no matching subdirectory — to keep older
+    # callers and tests behaving identically.
+    multi_layout = any(
+        os.path.isdir(os.path.join(per_source_dir, d)) for d in domains
+    )
+    if not multi_layout:
+        # Legacy layout — flat dir, single domain.
+        return _bundle_one_domain(per_source_dir, output_dir, domains[0])
+
+    zip_paths: List[str] = []
+    for d in domains:
+        sub = os.path.join(per_source_dir, d)
+        if not os.path.isdir(sub):
+            continue
+        zip_paths.extend(_bundle_one_domain(sub, output_dir, d))
+    return zip_paths
+
+
 def _run_extraction_zip_stream(
     archive_path: str,
-    domain: str,
+    domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
     output_dir: str,
     start: float,
 ) -> ExtractionResult:
     """Fast path for plain zip archives: walk members in place, scan
-    each one in memory, write per-source .txt files + bundle into zip.
+    each one in memory, write per-source .txt files (one folder per
+    target domain) + bundle into one zip per domain.
 
     Saves the disk-space + wall-clock cost of first unpacking the whole
     archive to a temp dir, matching u.txt's ``extractZipStreaming`` idea.
@@ -1181,11 +1286,23 @@ def _run_extraction_zip_stream(
     progress.extract_start = time.monotonic()
     progress.current_file = ""
 
+    domains = _coerce_domains(domain)
+
     per_source_dir = tempfile.mkdtemp(
         dir=str(config.TEMP_DIR), prefix="cookie_out_",
     )
-    safe_domain = re.sub(r"[^A-Za-z0-9._-]", "_", domain)
-    cookie_parser = SmartCookieExtractor(domain)
+    # One subdirectory per target domain so _bundle_all_zips can produce
+    # one zip per domain.
+    safe_targets: Dict[str, str] = {}
+    file_counters: Dict[str, int] = {}
+    for d in domains:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", d)
+        safe_targets[d] = safe
+        file_counters[d] = 1
+        os.makedirs(os.path.join(per_source_dir, d), exist_ok=True)
+
+    cookie_parser = SmartCookieExtractor(domains)
+    per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
 
     try:
         try:
@@ -1202,12 +1319,13 @@ def _run_extraction_zip_stream(
             # extract+scan together, so there's no separate "extract
             # to disk" step for the dashboard to render.
             progress.phase = "scanning"
-            file_counter = 1
 
             for member in members:
                 if progress.cancelled:
                     break
-                progress.current_file = os.path.basename(member.filename) or member.filename
+                progress.current_file = (
+                    os.path.basename(member.filename) or member.filename
+                )
                 progress.extract_current += 1
 
                 # Hard cap per-entry size so a corrupt zip bomb can't
@@ -1238,28 +1356,44 @@ def _run_extraction_zip_stream(
                     cookies = []
 
                 if cookies:
-                    out_name = f"akaza_{safe_domain}_{file_counter}.txt"
-                    out_path = os.path.join(per_source_dir, out_name)
-                    try:
-                        with open(out_path, "w", encoding="utf-8") as fh2:
-                            for c in cookies:
-                                fh2.write(
-                                    f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
-                                    f"{c['secure']}\t{c['expiration']}\t"
-                                    f"{c['name']}\t{c['value']}\n"
-                                )
-                                progress.cookies_found += 1
-                        file_counter += 1
-                    except OSError:
-                        logger.exception(
-                            "Failed to write per-source file {}", out_path,
+                    # Group hits from this source file by target domain so
+                    # each target gets its own per-source ``akaza_*.txt``.
+                    by_target: Dict[str, List[Dict[str, str]]] = {}
+                    for c in cookies:
+                        t = c.get("target_domain", domains[0])
+                        by_target.setdefault(t, []).append(c)
+                    for t, group in by_target.items():
+                        safe = safe_targets.get(
+                            t, re.sub(r"[^A-Za-z0-9._-]", "_", t),
                         )
+                        idx = file_counters.get(t, 1)
+                        out_name = f"akaza_{safe}_{idx}.txt"
+                        sub_dir = os.path.join(per_source_dir, t)
+                        os.makedirs(sub_dir, exist_ok=True)
+                        out_path = os.path.join(sub_dir, out_name)
+                        try:
+                            with open(out_path, "w", encoding="utf-8") as fh2:
+                                for c in group:
+                                    fh2.write(
+                                        f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
+                                        f"{c['secure']}\t{c['expiration']}\t"
+                                        f"{c['name']}\t{c['value']}\n"
+                                    )
+                                    progress.cookies_found += 1
+                                    per_domain_counts[t] = (
+                                        per_domain_counts.get(t, 0) + 1
+                                    )
+                            file_counters[t] = idx + 1
+                        except OSError:
+                            logger.exception(
+                                "Failed to write per-source file {}", out_path,
+                            )
 
                 progress.files_scanned += 1
 
         progress.phase = "packaging"
         progress.current_file = ""
-        output_files = _bundle_all_zips(per_source_dir, output_dir, domain)
+        output_files = _bundle_all_zips(per_source_dir, output_dir, domains)
 
         output_files = [
             p for p in output_files
@@ -1277,6 +1411,7 @@ def _run_extraction_zip_stream(
                 duration_seconds=duration,
                 partial=True,
                 error="" if output_files else "Cancelled by user (no cookies found yet)",
+                per_domain_counts=per_domain_counts,
             )
 
         progress.phase = "done"
@@ -1286,6 +1421,7 @@ def _run_extraction_zip_stream(
             cookies_found=progress.cookies_found,
             files_scanned=progress.files_scanned,
             duration_seconds=duration,
+            per_domain_counts=per_domain_counts,
         )
 
     finally:
@@ -1294,14 +1430,20 @@ def _run_extraction_zip_stream(
 
 def _run_extraction(
     archive_path: str,
-    domain: str,
+    domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
     password: Optional[str] = None,
 ) -> ExtractionResult:
-    """Blocking extraction — meant to run inside ``asyncio.to_thread``."""
+    """Blocking extraction — meant to run inside ``asyncio.to_thread``.
+
+    Accepts either a single domain string or an iterable of domains. When
+    multiple domains are configured the archive is scanned once and each
+    target gets its own ``{domain}_cookies[_partN].zip`` output bundle.
+    """
     import time
 
     start = time.monotonic()
+    domains = _coerce_domains(domain)
     temp_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
     output_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
 
@@ -1315,14 +1457,17 @@ def _run_extraction(
             and not _probe_encrypted_entries(archive_path)
         ):
             return _run_extraction_zip_stream(
-                archive_path, domain, progress, output_dir, start,
+                archive_path, domains, progress, output_dir, start,
             )
 
         # Phase 1: extract archive
         progress.phase = "extracting"
         progress.extract_start = time.monotonic()
         progress.current_file = ""
-        logger.info("Extracting archive {} into {}", archive_path, temp_dir)
+        logger.info(
+            "Extracting archive {} into {} for domains={}",
+            archive_path, temp_dir, domains,
+        )
         _extract_archive(archive_path, temp_dir, progress, password=password)
 
         if progress.cancelled:
@@ -1335,11 +1480,11 @@ def _run_extraction(
             )
 
         # Phase 2: scan files. Mirrors the reference layout from
-        # `log to cookie.py`: one .txt per source file that yielded
+        # ``log to cookie.py``: one .txt per source file that yielded
         # matching cookies, named ``akaza_{domain}_{counter}.txt`` and
-        # then all of them bundled into a single ``.zip``.
+        # then bundled into one zip per target domain.
         progress.phase = "scanning"
-        extractor = SmartCookieExtractor(domain)
+        extractor = SmartCookieExtractor(domains)
 
         all_files: List[str] = []
         for root, _dirs, files in os.walk(temp_dir):
@@ -1350,8 +1495,13 @@ def _run_extraction(
         per_source_dir = tempfile.mkdtemp(
             dir=str(config.TEMP_DIR), prefix="cookie_out_"
         )
-        safe_domain = re.sub(r"[^A-Za-z0-9._-]", "_", domain)
-        file_counter = 1
+        safe_targets: Dict[str, str] = {
+            d: re.sub(r"[^A-Za-z0-9._-]", "_", d) for d in domains
+        }
+        file_counters: Dict[str, int] = {d: 1 for d in domains}
+        per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
+        for d in domains:
+            os.makedirs(os.path.join(per_source_dir, d), exist_ok=True)
 
         for fpath in all_files:
             if progress.cancelled:
@@ -1362,26 +1512,44 @@ def _run_extraction(
             except Exception:
                 cookies = []
             if cookies:
-                out_name = f"akaza_{safe_domain}_{file_counter}.txt"
-                out_path = os.path.join(per_source_dir, out_name)
-                try:
-                    with open(out_path, "w", encoding="utf-8") as fh:
-                        for c in cookies:
-                            fh.write(
-                                f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
-                                f"{c['secure']}\t{c['expiration']}\t"
-                                f"{c['name']}\t{c['value']}\n"
-                            )
-                            progress.cookies_found += 1
-                    file_counter += 1
-                except OSError:
-                    logger.exception("Failed to write per-source file {}", out_path)
+                # Group by target domain so each gets its own per-source
+                # ``akaza_*.txt`` file.
+                by_target: Dict[str, List[Dict[str, str]]] = {}
+                for c in cookies:
+                    t = c.get("target_domain", domains[0])
+                    by_target.setdefault(t, []).append(c)
+                for t, group in by_target.items():
+                    safe = safe_targets.get(
+                        t, re.sub(r"[^A-Za-z0-9._-]", "_", t),
+                    )
+                    idx = file_counters.get(t, 1)
+                    out_name = f"akaza_{safe}_{idx}.txt"
+                    sub_dir = os.path.join(per_source_dir, t)
+                    os.makedirs(sub_dir, exist_ok=True)
+                    out_path = os.path.join(sub_dir, out_name)
+                    try:
+                        with open(out_path, "w", encoding="utf-8") as fh:
+                            for c in group:
+                                fh.write(
+                                    f"{c['domain']}\t{c['flag']}\t{c['path']}\t"
+                                    f"{c['secure']}\t{c['expiration']}\t"
+                                    f"{c['name']}\t{c['value']}\n"
+                                )
+                                progress.cookies_found += 1
+                                per_domain_counts[t] = (
+                                    per_domain_counts.get(t, 0) + 1
+                                )
+                        file_counters[t] = idx + 1
+                    except OSError:
+                        logger.exception(
+                            "Failed to write per-source file {}", out_path,
+                        )
             progress.files_scanned += 1
 
-        # Phase 3: bundle all per-source .txt files into a .zip.
+        # Phase 3: bundle per-source .txt files into one zip per domain.
         progress.phase = "packaging"
         progress.current_file = ""
-        output_files = _bundle_all_zips(per_source_dir, output_dir, domain)
+        output_files = _bundle_all_zips(per_source_dir, output_dir, domains)
 
         # The per-source temp dir is no longer needed once zipped.
         shutil.rmtree(per_source_dir, ignore_errors=True)
@@ -1404,6 +1572,7 @@ def _run_extraction(
                 duration_seconds=duration,
                 partial=True,
                 error="" if output_files else "Cancelled by user (no cookies found yet)",
+                per_domain_counts=per_domain_counts,
             )
 
         progress.phase = "done"
@@ -1413,6 +1582,7 @@ def _run_extraction(
             cookies_found=progress.cookies_found,
             files_scanned=progress.files_scanned,
             duration_seconds=duration,
+            per_domain_counts=per_domain_counts,
         )
 
     except Exception as exc:
@@ -1430,11 +1600,16 @@ def _run_extraction(
 
 async def run_extraction_async(
     archive_path: str,
-    domain: str,
+    domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
     password: Optional[str] = None,
 ) -> ExtractionResult:
-    """Non-blocking facade — offloads heavy work to a thread."""
+    """Non-blocking facade — offloads heavy work to a thread.
+
+    *domain* may be either a single domain string or an iterable of
+    domain strings; in the multi-domain case each target gets its own
+    output zip.
+    """
     return await asyncio.to_thread(
         _run_extraction, archive_path, domain, progress, password
     )
