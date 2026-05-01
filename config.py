@@ -28,7 +28,10 @@ ADMIN_ID: int = _int("ADMIN_ID", 5944410248)
 # SESSION_STRING is no longer needed — Pyrogram downloads via bot token directly
 
 # ── Processing ──────────────────────────────────────────────
-MAX_CONCURRENT_JOBS: int = _int("MAX_CONCURRENT_JOBS", 2)
+# Hard cap on concurrent extraction jobs across the whole bot. The
+# queue uses a three-tier priority system (admin > VIP > free) so heavy
+# load doesn't starve admins/VIPs.
+MAX_CONCURRENT_JOBS: int = _int("MAX_CONCURRENT_JOBS", 15)
 FREE_DAILY_LIMIT_GB: int = _int("FREE_DAILY_LIMIT_GB", 2)
 FREE_DAILY_LIMIT_BYTES: int = FREE_DAILY_LIMIT_GB * 1024 ** 3
 FREE_MAX_FILE_BYTES: int = 2 * 1024 ** 3          # 2 GB
@@ -41,6 +44,13 @@ TEMP_DIR: Path = Path(_str("TEMP_DIR", "/tmp/cookiebot"))
 
 # ── Extraction ──────────────────────────────────────────────
 MAX_DOMAINS_PER_EXTRACT: int = _int("MAX_DOMAINS_PER_EXTRACT", 10)
+
+# ── Rescan window ───────────────────────────────────────────
+# After a successful extraction the source archive is kept on disk for
+# this many seconds so the user can search additional domains in the
+# same archive without re-uploading. After the window expires the
+# archive is auto-deleted. Default: 2 minutes.
+RESCAN_WINDOW_SECONDS: int = _int("RESCAN_WINDOW_SECONDS", 120)
 
 # ── Rate-limits / anti-abuse ────────────────────────────────
 MAX_EXTRACTIONS_PER_HOUR: int = 3

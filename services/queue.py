@@ -1,5 +1,12 @@
 """
-Async job-queue manager with VIP priority and concurrency control.
+Async job-queue manager with three-tier priority and concurrency control.
+
+Priority tiers (lower = served first):
+  * ``PRIORITY_ADMIN``  — 0 — bot admins, never wait.
+  * ``PRIORITY_VIP``    — 1 — VIP users, ahead of free.
+  * ``PRIORITY_FREE``   — 2 — everyone else.
+
+Hard concurrency cap is :data:`config.MAX_CONCURRENT_JOBS`.
 """
 
 from __future__ import annotations
@@ -14,9 +21,28 @@ from loguru import logger
 import config
 
 
+# Three-tier priority constants. Lower values are served first.
+PRIORITY_ADMIN: int = 0
+PRIORITY_VIP: int = 1
+PRIORITY_FREE: int = 2
+
+
+def priority_for(is_admin: bool, is_vip: bool) -> int:
+    """Return the queue priority appropriate for *is_admin* / *is_vip*."""
+    if is_admin:
+        return PRIORITY_ADMIN
+    if is_vip:
+        return PRIORITY_VIP
+    return PRIORITY_FREE
+
+
 @dataclass(order=True)
 class QueueItem:
-    """Priority wrapper — lower ``priority`` values run first."""
+    """Priority wrapper — lower ``priority`` values run first.
+
+    Use :func:`priority_for` to compute the right value from a user's
+    admin / VIP flags.
+    """
     priority: int
     job_id: int = field(compare=False)
     user_id: int = field(compare=False)
@@ -41,7 +67,12 @@ class JobQueue:
         """Spawn the background consumer loop."""
         if self._workers_task is None or self._workers_task.done():
             self._workers_task = asyncio.create_task(self._consumer_loop())
-            logger.info("Job queue consumer started (concurrency={})", config.MAX_CONCURRENT_JOBS)
+            logger.info(
+                "Job queue consumer started "
+                "(max concurrency={}, priorities: admin={} vip={} free={})",
+                config.MAX_CONCURRENT_JOBS,
+                PRIORITY_ADMIN, PRIORITY_VIP, PRIORITY_FREE,
+            )
 
     async def stop(self) -> None:
         if self._workers_task and not self._workers_task.done():
