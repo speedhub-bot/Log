@@ -15,7 +15,8 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from loguru import logger
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -38,7 +39,7 @@ from services.extractor import (
     probe_encrypted_entries_async,
     run_extraction_async,
 )
-from services.queue import JobQueue, QueueItem
+from services.queue import JobQueue, QueueItem, priority_for
 from utils.formatting import bytes_human, progress_bar, seconds_human, time_until
 from utils.validators import validate_archive, validate_domains
 
@@ -60,6 +61,112 @@ _pending_passwords: Dict[int, "asyncio.Future[Optional[str]]"] = {}
 # auto-skip and proceed with ``-p-``. Keeps stuck jobs from pinning a
 # queue worker forever.
 PASSWORD_PROMPT_TIMEOUT = 300.0  # 5 minutes
+
+
+# ── Rescan window ──────────────────────────────────────────
+@dataclass
+class RescanEntry:
+    """A still-on-disk archive the user can re-search within the window."""
+    user_id: int
+    archive_path: str
+    file_name: str
+    file_size: int
+    password: Optional[str]
+    expires_at: float                       # monotonic clock
+    cleanup_task: "asyncio.Task[None]" = field(repr=False)
+
+
+# user_id -> RescanEntry. At most one open rescan window per user.
+_rescan_store: Dict[int, RescanEntry] = {}
+
+
+def _rescan_dir() -> str:
+    """Long-lived rescan directory under TEMP_DIR (created on demand)."""
+    p = os.path.join(str(config.TEMP_DIR), "rescan")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+async def _delete_rescan_after(user_id: int, delay: float) -> None:
+    """Sleep *delay* seconds then drop the user's rescan archive."""
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+    entry = _rescan_store.pop(user_id, None)
+    if entry is None:
+        return
+    try:
+        if os.path.exists(entry.archive_path):
+            os.remove(entry.archive_path)
+    except OSError:
+        logger.exception(
+            "Rescan cleanup failed for {}", entry.archive_path,
+        )
+    logger.info(
+        "Rescan window closed for user {} ({})",
+        user_id, entry.file_name,
+    )
+
+
+def _register_rescan(
+    user_id: int,
+    archive_path: str,
+    file_name: str,
+    file_size: int,
+    window_seconds: float,
+    password: Optional[str] = None,
+) -> RescanEntry:
+    """Register *archive_path* as a fresh rescan entry for *user_id*.
+
+    Cancels any previously-open rescan window for this user and removes
+    its archive, then schedules a new cleanup task to fire in
+    *window_seconds*. The caller is responsible for placing
+    *archive_path* somewhere persistent (typically under
+    :func:`_rescan_dir`) before calling this.
+    """
+    prev = _rescan_store.pop(user_id, None)
+    if prev is not None:
+        prev.cleanup_task.cancel()
+        if prev.archive_path != archive_path:
+            try:
+                if os.path.exists(prev.archive_path):
+                    os.remove(prev.archive_path)
+            except OSError:
+                pass
+    expires_at = time.monotonic() + window_seconds
+    task = asyncio.create_task(_delete_rescan_after(user_id, window_seconds))
+    entry = RescanEntry(
+        user_id=user_id,
+        archive_path=archive_path,
+        file_name=file_name,
+        file_size=file_size,
+        password=password,
+        expires_at=expires_at,
+        cleanup_task=task,
+    )
+    _rescan_store[user_id] = entry
+    return entry
+
+
+def _peek_rescan(user_id: int) -> Optional[RescanEntry]:
+    """Return the user's open rescan entry or ``None`` if missing/expired.
+
+    Cleans up the store as a side-effect when the window has expired or
+    the on-disk archive has already vanished.
+    """
+    entry = _rescan_store.get(user_id)
+    if entry is None:
+        return None
+    if (
+        entry.expires_at < time.monotonic()
+        or not os.path.exists(entry.archive_path)
+    ):
+        prev = _rescan_store.pop(user_id, None)
+        if prev is not None:
+            prev.cleanup_task.cancel()
+        return None
+    return entry
 
 
 def _cancel_kb() -> InlineKeyboardMarkup:
@@ -166,6 +273,20 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # (e.g. older logging hooks).
     context.user_data["extract_domain"] = domains[0]  # type: ignore[index]
 
+    # Rescan flow: skip the FILE state entirely and reuse the cached
+    # archive that's still under the rescan store.
+    if context.user_data.get("extract_rescan"):  # type: ignore[union-attr]
+        context.user_data.pop("extract_rescan", None)  # type: ignore[union-attr]
+        entry = _peek_rescan(user.id)
+        if entry is None:
+            await update.message.reply_text(
+                "\u23f0 Rescan window closed before you replied.\n"
+                "Use /extract to upload a new archive.",
+            )
+            return ConversationHandler.END
+        await _kickoff_rescan_job(update, context, entry, domains)
+        return ConversationHandler.END
+
     is_admin = user.id == config.ADMIN_ID
     remaining = await db.get_remaining_quota(user.id)
     vip = await db.is_vip(user.id)
@@ -198,6 +319,101 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     await update.message.reply_text(text, reply_markup=_cancel_kb())
     return FILE
+
+
+# ── Rescan entry / job kickoff ─────────────────────────────
+async def rescan_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    """Conversation entry triggered by the 'Search more domains' button."""
+    user = update.effective_user
+    q = update.callback_query
+    if user is None or q is None:
+        return ConversationHandler.END
+
+    await q.answer()
+    entry = _peek_rescan(user.id)
+    if entry is None:
+        try:
+            await q.edit_message_text(
+                "\u23f0 Rescan window closed \u2014 the archive was already "
+                "deleted.\nUse /extract to upload a new archive.",
+            )
+        except Exception:
+            pass
+        return ConversationHandler.END
+
+    remaining = max(0, int(entry.expires_at - time.monotonic()))
+    mins, secs = divmod(remaining, 60)
+    text = (
+        f"\U0001f501 Rescan: <code>{entry.file_name}</code>\n"
+        f"\u23f3 {mins}m {secs}s left before this archive is deleted.\n\n"
+        f"Enter one or more domains to search in the same archive.\n"
+        f"Up to {config.MAX_DOMAINS_PER_EXTRACT} domains, separated by "
+        f"commas, spaces or new lines."
+    )
+    try:
+        await q.edit_message_text(
+            text, parse_mode="HTML", reply_markup=_cancel_kb(),
+        )
+    except Exception:
+        pass
+
+    context.user_data["extract_rescan"] = True  # type: ignore[index]
+    return DOMAIN
+
+
+async def _kickoff_rescan_job(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    entry: RescanEntry,
+    domains: list[str],
+) -> None:
+    """Enqueue a rescan job that reuses *entry*'s cached archive."""
+    user = update.effective_user
+    assert user is not None and update.message is not None
+
+    is_admin = user.id == config.ADMIN_ID
+    vip = await db.is_vip(user.id)
+    domain_label = ", ".join(domains)
+
+    # Rescans don't consume daily quota — the archive bytes were
+    # already counted against the user when they originally uploaded
+    # it. They still go through the priority queue.
+    job_id = await db.create_job(
+        user.id, domain_label, entry.file_name, entry.file_size,
+    )
+
+    progress_msg = await update.message.reply_text(
+        "\u23f3 Queued for rescan...",
+        reply_markup=_cancel_job_kb(job_id),
+    )
+
+    progress = ExtractionProgress()
+    _active_progress[job_id] = progress
+
+    async def _worker() -> None:
+        await _process_job(
+            update, context, job_id, user.id, domains,
+            ("rescan", entry.archive_path, entry.file_name),
+            progress_msg, progress,
+        )
+
+    item = QueueItem(
+        priority=priority_for(is_admin, vip),
+        job_id=job_id,
+        user_id=user.id,
+        is_vip=vip,
+        coro_factory=_worker,
+    )
+    assert _job_queue is not None
+    pos = await _job_queue.enqueue(item)
+    if pos > 0:
+        await progress_msg.edit_text(
+            f"\u23f3 You are #{pos + 1} in queue (rescan).\n"
+            f"Estimated wait: ~{pos * 4} minutes",
+            reply_markup=_cancel_job_kb(job_id),
+        )
 
 
 # ── State: FILE ────────────────────────────────────────────
@@ -290,10 +506,10 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             source_ref, progress_msg, progress,
         )
 
-    # Enqueue
+    # Enqueue with three-tier priority (admin > VIP > free).
     is_vip_flag = await db.is_vip(user.id)
     item = QueueItem(
-        priority=0 if (is_vip_flag or is_admin) else 1,
+        priority=priority_for(is_admin, is_vip_flag),
         job_id=job_id,
         user_id=user.id,
         is_vip=is_vip_flag,
@@ -369,7 +585,7 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
 
     item = QueueItem(
-        priority=0 if (vip or is_admin) else 1,
+        priority=priority_for(is_admin, vip),
         job_id=job_id,
         user_id=user.id,
         is_vip=vip,
@@ -411,23 +627,42 @@ async def _process_job(
             _progress_updater(progress_msg, job_id, progress)
         )
 
-        # Download — either from a Telegram document (original_msg is the
-        # Message) or from a direct URL (tuple: ("url", url, name)).
-        if isinstance(original_msg, tuple) and original_msg and original_msg[0] == "url":
+        # Decide where the archive comes from. Three source kinds:
+        #   1. Telegram document upload  (original_msg is the Message)
+        #   2. Direct download URL       (tuple: ("url", url, name))
+        #   3. Rescan of a cached archive (tuple: ("rescan", path, name))
+        #
+        # Case 3 skips both the download and the password prompt —
+        # the archive is already on disk under the rescan store and
+        # the original-extraction's password (if any) is cached on the
+        # rescan entry.
+        is_rescan = (
+            isinstance(original_msg, tuple)
+            and original_msg
+            and original_msg[0] == "rescan"
+        )
+        if is_rescan:
+            _, existing_path, _ = original_msg
+            archive_path = existing_path
+            cached_entry = _rescan_store.get(user_id)
+            password = cached_entry.password if cached_entry else None
+        elif (
+            isinstance(original_msg, tuple)
+            and original_msg
+            and original_msg[0] == "url"
+        ):
             _, url_value, name_hint = original_msg
             archive_path = await download_from_url(
                 url_value, temp_dir, progress, file_name_hint=name_hint,
             )
+            password = await _maybe_prompt_for_password(
+                context, user_id, archive_path, progress_msg, job_id,
+            )
         else:
             archive_path = await download_file(original_msg, temp_dir, progress)
-
-        # Password-protected entry probe. If the archive contains
-        # encrypted entries, ask the user for the password before we
-        # kick off extraction — otherwise those entries would be
-        # skipped silently and the cookies inside them would be lost.
-        password = await _maybe_prompt_for_password(
-            context, user_id, archive_path, progress_msg, job_id,
-        )
+            password = await _maybe_prompt_for_password(
+                context, user_id, archive_path, progress_msg, job_id,
+            )
 
         # Extract — run_extraction_async accepts a single domain string
         # or a list of domains for multi-target jobs.
@@ -501,6 +736,59 @@ async def _process_job(
         job_row = await db.get_job(job_id)
         file_size = job_row["file_size_bytes"] if job_row else 0  # type: ignore[index]
 
+        # Stash this archive in the rescan store so the user can search
+        # additional domains in the same archive without re-uploading.
+        # Only do this for clean (non-partial) successes — partial /
+        # cancelled jobs probably failed for a reason and the archive
+        # may be corrupt.
+        rescan_armed = False
+        rescan_minutes = max(1, config.RESCAN_WINDOW_SECONDS // 60)
+        try:
+            if result.success and not result.partial and archive_path:
+                if is_rescan:
+                    # Already in the rescan dir — just refresh the timer.
+                    if os.path.exists(archive_path):
+                        cached_entry = _rescan_store.get(user_id)
+                        cached_pw = cached_entry.password if cached_entry else None
+                        cached_name = (
+                            cached_entry.file_name if cached_entry
+                            else os.path.basename(archive_path)
+                        )
+                        cached_size = (
+                            cached_entry.file_size if cached_entry
+                            else os.path.getsize(archive_path)
+                        )
+                        _register_rescan(
+                            user_id,
+                            archive_path,
+                            cached_name,
+                            cached_size,
+                            float(config.RESCAN_WINDOW_SECONDS),
+                            password=cached_pw,
+                        )
+                        rescan_armed = True
+                elif os.path.exists(archive_path):
+                    target_dir = _rescan_dir()
+                    target_name = (
+                        f"{user_id}_{job_id}_{os.path.basename(archive_path)}"
+                    )
+                    target_path = os.path.join(target_dir, target_name)
+                    shutil.move(archive_path, target_path)
+                    _register_rescan(
+                        user_id,
+                        target_path,
+                        os.path.basename(archive_path),
+                        os.path.getsize(target_path),
+                        float(config.RESCAN_WINDOW_SECONDS),
+                        password=password,
+                    )
+                    rescan_armed = True
+        except Exception:
+            logger.exception(
+                "Failed to register rescan window for user {}", user_id,
+            )
+            rescan_armed = False
+
         # Summary
         header = (
             "\u26a0\ufe0f Cancelled \u2014 partial results delivered"
@@ -523,18 +811,40 @@ async def _process_job(
             f"\U0001f4c1 Files scanned: {result.files_scanned:,}\n"
             f"\U0001f4e6 Archive size: {bytes_human(file_size)}\n"
             f"\u23f1 Time taken: {seconds_human(duration)}\n"
-            f"\U0001f4c4 Output files: {len(result.output_files)}\n\n"
-            f"\U0001f338 Credits: @akaza_isnt"
+            f"\U0001f4c4 Output files: {len(result.output_files)}\n"
         )
+        if rescan_armed:
+            summary += (
+                f"\n\u23f0 Heads up: this archive will be auto-deleted from "
+                f"disk in {rescan_minutes} minute(s).\n"
+                f"Missed a domain? Tap \U0001f501 below within "
+                f"{rescan_minutes} minute(s) to search more domains in the "
+                f"SAME archive without re-uploading.\n"
+            )
+        summary += "\n\U0001f338 Credits: @akaza_isnt"
+
+        keyboard: list[list[InlineKeyboardButton]] = []
+        if rescan_armed:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"\U0001f501 Search more domains ({rescan_minutes} min)",
+                    callback_data="rescan_more",
+                ),
+            ])
+        keyboard.append([
+            InlineKeyboardButton(
+                "\U0001f50d Extract Again", callback_data="extract",
+            ),
+            InlineKeyboardButton(
+                "\U0001f4ca My Stats", callback_data="mystats",
+            ),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("\U0001f3e0 Home", callback_data="home"),
+        ])
         await progress_msg.edit_text(
             summary,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("\U0001f50d Extract Again", callback_data="extract"),
-                    InlineKeyboardButton("\U0001f4ca My Stats", callback_data="mystats"),
-                ],
-                [InlineKeyboardButton("\U0001f3e0 Home", callback_data="home")],
-            ]),
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
     except Exception as exc:
@@ -910,6 +1220,8 @@ def register(app, job_queue: JobQueue) -> None:
         entry_points=[
             CallbackQueryHandler(extract_entry, pattern="^extract$"),
             CommandHandler("extract", extract_entry),
+            # 'Search more domains' button after a successful extraction.
+            CallbackQueryHandler(rescan_entry, pattern="^rescan_more$"),
         ],
         states={
             DOMAIN: [
