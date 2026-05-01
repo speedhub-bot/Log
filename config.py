@@ -39,6 +39,9 @@ DATABASE_PATH: str = _str("DATABASE_PATH", "bot.db")
 LOG_FILE: str = _str("LOG_FILE", "bot.log")
 TEMP_DIR: Path = Path(_str("TEMP_DIR", "/tmp/cookiebot"))
 
+# ── Extraction ──────────────────────────────────────────────
+MAX_DOMAINS_PER_EXTRACT: int = _int("MAX_DOMAINS_PER_EXTRACT", 10)
+
 # ── Rate-limits / anti-abuse ────────────────────────────────
 MAX_EXTRACTIONS_PER_HOUR: int = 3
 SPAM_MSG_LIMIT: int = 10          # messages within window
