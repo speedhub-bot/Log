@@ -145,6 +145,18 @@ async def download_file(
     except ImportError:
         FloodWait = None  # type: ignore[assignment]
 
+    # ``StopTransmission`` is what pyrogram raises (and catches) to abort
+    # an in-flight download from the progress callback. We use it to
+    # honour ``progress.cancelled`` from the cancel button.
+    try:
+        from pyrogram.errors import StopTransmission
+    except ImportError:
+        try:
+            from pyrogram import StopTransmission  # type: ignore[attr-defined]
+        except Exception:
+            class StopTransmission(Exception):  # type: ignore[no-redef]
+                pass
+
     attempt = 0
     while True:
         attempt += 1
@@ -155,6 +167,11 @@ async def download_file(
 
         def _progress_cb(current: int, total: int) -> None:
             nonlocal last_log, last_bytes, peak_mbps
+            # Honour the cancel button. Raising StopTransmission inside
+            # pyrogram's progress callback is the documented way to
+            # abort a transfer mid-flight; pyrogram catches it cleanly.
+            if progress.cancelled:
+                raise StopTransmission()
             progress.download_current = current
             progress.download_total = total
             now = time.monotonic()
@@ -187,6 +204,10 @@ async def download_file(
             )
             break
         except Exception as exc:
+            # User pressed Cancel during download.
+            if isinstance(exc, StopTransmission) or progress.cancelled:
+                logger.info("Download cancelled by user (progress.cancelled set)")
+                raise asyncio.CancelledError("Download cancelled by user") from exc
             # FloodWait: server asked us to back off — sleep and retry.
             if FloodWait is not None and isinstance(exc, FloodWait):
                 wait = getattr(exc, "value", getattr(exc, "x", 5))
@@ -315,8 +336,8 @@ async def download_from_url(
                             resp.close()
                         except Exception:
                             pass
-                        raise RuntimeError(
-                            "Download cancelled by user"
+                        raise asyncio.CancelledError(
+                            "URL download cancelled by user"
                         )
                     fh.write(chunk)
                     downloaded += len(chunk)
