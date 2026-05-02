@@ -5,7 +5,7 @@ Input validation utilities.
 from __future__ import annotations
 
 import re
-from typing import Tuple
+from typing import List, Tuple, Union
 
 # Accepted archive extensions and their MIME types
 SUPPORTED_EXTENSIONS: dict[str, list[str]] = {
@@ -21,6 +21,10 @@ _DOMAIN_RE = re.compile(
     r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+"
     r"[a-zA-Z]{2,}$"
 )
+
+# Splits user input into individual domain tokens. We accept commas,
+# semicolons, pipes, and any whitespace (incl. newlines) as separators.
+_DOMAIN_SPLIT_RE = re.compile(r"[,\s;|]+")
 
 
 def validate_domain(raw: str) -> Tuple[bool, str]:
@@ -39,6 +43,48 @@ def validate_domain(raw: str) -> Tuple[bool, str]:
     if not _DOMAIN_RE.match(domain):
         return False, f"Invalid domain format: {domain}"
     return True, domain
+
+
+def validate_domains(
+    raw: str,
+    max_count: int = 10,
+) -> Tuple[bool, Union[List[str], str]]:
+    """
+    Validate and normalise a list of domains supplied as a single string.
+
+    Accepts any combination of commas, semicolons, pipes, spaces and
+    newlines as separators. Each token is run through :func:`validate_domain`,
+    duplicates are removed (preserving the user's original ordering), and the
+    final list is capped at *max_count* entries.
+
+    Returns:
+        (True,  list_of_cleaned_domains)  on success
+        (False, error_message)            on the first validation failure
+    """
+    if not raw or not raw.strip():
+        return False, "Please send at least one domain (e.g. spotify.com)"
+
+    tokens = [t for t in _DOMAIN_SPLIT_RE.split(raw.strip()) if t]
+    if not tokens:
+        return False, "Please send at least one domain (e.g. spotify.com)"
+
+    if len(tokens) > max_count:
+        return False, (
+            f"Too many domains ({len(tokens)}). "
+            f"Maximum allowed per extraction: {max_count}."
+        )
+
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        ok, value = validate_domain(tok)
+        if not ok:
+            return False, value
+        if value not in seen:
+            seen.add(value)
+            cleaned.append(value)
+
+    return True, cleaned
 
 
 def validate_archive(file_name: str | None, mime_type: str | None) -> Tuple[bool, str]:

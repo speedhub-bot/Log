@@ -1,0 +1,551 @@
+
+// ─── Streaming ZIP extractor (no full-file buffering) ────────────────────────
+
+async function extractZipStreaming(
+  filePath: string,
+  domains: string[],
+  result: FullExtractResult,
+  onProgress?: ProgressCallback,
+): Promise<void> {
+  let filesScanned = 0;
+  let totalFiles   = 0;
+
+  await new Promise<void>((resolve, reject) => {
+    const pending: Promise<void>[] = [];
+
+    const unzip = new Unzip((file) => {
+      const kind = getFileKind(file.name);
+      if (kind === null) return; // not a relevant file — skip without starting
+
+      // If already at cap, skip this file (start but drain data without processing)
+      if (resultCapped(result)) {
+        result.capped = true;
+        file.ondata = (_err, _chunk, _final) => {};
+        file.start();
+        return;
+      }
+
+      totalFiles++;
+      const chunks: Uint8Array[] = [];
+
+      const p = new Promise<void>((done) => {
+        file.ondata = (_err, chunk, final) => {
+          if (chunk) chunks.push(chunk);
+          if (!final) return;
+
+          // Merge decompressed chunks (fast, synchronous)
+          const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+          const merged   = new Uint8Array(totalLen);
+          let off = 0;
+          for (const c of chunks) { merged.set(c, off); off += c.length; }
+
+          // Defer CPU-heavy decode + parse to its own event loop turn so the
+          // webhook handler can process other Telegram messages between files.
+          setImmediate(() => {
+            let text: string;
+            try   { text = decode(merged); }
+            catch { done(); return; }
+
+            if (!resultCapped(result)) {
+              if (kind === "cookie") {
+                const cookies = parseCookies(text, domains);
+                if (cookies.length) { result.cookies.push({ sourceFile: file.name, cookies }); result.totalCookies += cookies.length; }
+              } else if (kind === "password") {
+                const entries = parsePasswords(text, domains);
+                if (entries.length) { result.passwords.push({ sourceFile: file.name, entries }); result.totalPasswords += entries.length; }
+              } else if (kind === "cc") {
+                const cards = parseCC(text);
+                result.cards.push(...cards);
+                result.totalCards += cards.length;
+              }
+            } else {
+              result.capped = true;
+            }
+
+            filesScanned++;
+            onProgress?.({ filesScanned, totalFiles, cookiesFound: result.totalCookies, passwordsFound: result.totalPasswords, cardsFound: result.totalCards });
+            done();
+          });
+        };
+      });
+
+      pending.push(p);
+      file.start();
+    });
+
+    unzip.register(UnzipInflate);
+    unzip.register(UnzipPassThrough);
+
+    const rs = createReadStream(filePath, { highWaterMark: 256 * 1024 }); // 256 KB chunks — smaller slices = more event loop ticks
+
+    rs.on("data", (raw: Buffer | string) => {
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as string);
+      try {
+        unzip.push(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength), false);
+      } catch (e) {
+        rs.destroy(e as Error);
+      }
+    });
+
+    rs.on("end", () => {
+      try {
+        unzip.push(new Uint8Array(0), true);
+        Promise.all(pending).then(() => resolve()).catch(reject);
+      } catch (e) {
+        reject(e);
+      }
+    });
+
+    rs.on("error", reject);
+  });
+}
+
+// ─── File-based RAR extractor (unar binary — no WASM, no 4 GB limit) ──────────
+
+export async function walkDir(dir: string): Promise<string[]> {
+  const files: string[] = [];
+  const items = await fsp.readdir(dir);
+  for (const item of items) {
+    const full = join(dir, item);
+    const st = await fsp.stat(full);
+    if (st.isDirectory()) {
+      files.push(...(await walkDir(full)));
+    } else {
+      files.push(full);
+    }
+  }
+  return files;
+}
+
+/**
+ * Scan an already-extracted directory for cookies, passwords and CC files.
+ * This is the inner scanning loop — call it on a directory that already has
+ * files unpacked into it (e.g. after unar runs in the URL handler).
+ */
+async function scanDir(
+  dir: string,
+  domains: string[],
+  result: FullExtractResult,
+  onProgress?: ProgressCallback,
+): Promise<void> {
+  const filePaths = await walkDir(dir);
+  const relevant  = filePaths.filter(fp => getFileKind(fp) !== null);
+  const total     = relevant.length;
+  let scanned     = 0;
+
+  // Track totals for diagnostic summary
+  result.totalFilesScanned = (result.totalFilesScanned ?? 0) + filePaths.length;
+  result.relevantFiles     = (result.relevantFiles     ?? 0) + total;
+
+  for (const fp of filePaths) {
+    if (resultCapped(result)) { result.capped = true; break; }
+    const kind = getFileKind(fp);
+    if (!kind) continue;
+
+    let buf: Buffer;
+    try { buf = await fsp.readFile(fp); }
+    catch { result.errors.push(`Cannot read: ${fp}`); scanned++; continue; }
+
+    let content: string;
+    try { content = decode(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)); }
+    catch { result.errors.push(`Cannot decode: ${fp}`); scanned++; continue; }
+
+    const rel = fp.slice(dir.length + 1);
+    if (kind === "cookie") {
+      const cookies = parseCookies(content, domains);
+      if (cookies.length) { result.cookies.push({ sourceFile: rel, cookies }); result.totalCookies += cookies.length; }
+    } else if (kind === "password") {
+      const entries = parsePasswords(content, domains);
+      if (entries.length) { result.passwords.push({ sourceFile: rel, entries }); result.totalPasswords += entries.length; }
+    } else if (kind === "cc") {
+      const cards = parseCC(content);
+      result.cards.push(...cards); result.totalCards += cards.length;
+    }
+
+    scanned++;
+    onProgress?.({ filesScanned: scanned, totalFiles: total, cookiesFound: result.totalCookies, passwordsFound: result.totalPasswords, cardsFound: result.totalCards });
+    // Yield event loop every 10 files so the webhook handler stays responsive
+    if (scanned % 10 === 0) await new Promise(r => setImmediate(r));
+  }
+}
+
+/**
+ * Check whether a ZIP or RAR archive is password-protected.
+ * Uses `7z l -slt` which outputs `Encrypted = +` for any encrypted entry.
+ */
+export async function checkPasswordProtected(filePath: string): Promise<boolean> {
+  try {
+    return await new Promise<boolean>((resolve) => {
+      const proc = spawn(BIN_7Z, ["l", "-slt", filePath], { stdio: ["ignore", "pipe", "ignore"] });
+      // Attach a no-op error handler immediately so EIO / resource errors are
+      // always handled, even before the close/error handlers below are wired up.
+      proc.on("error", () => {});
+      let stdout = "";
+      proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.stdout?.on("error", () => {});
+      proc.on("close", () => resolve(stdout.includes("Encrypted = +")));
+      proc.on("error", () => resolve(false));
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function runRarExtractor(filePath: string, tmpOut: string, password?: string): Promise<number> {
+  // ── Try unar first (handles RAR 1–4 reliably, often RAR5) ────────────────
+  const unarArgs = [
+    "-output-directory", tmpOut,
+    "-force-overwrite",
+    "-no-directory",
+    "-quiet",
+    ...(password ? ["-password", password] : []),
+    filePath,
+  ];
+  const unarOk = await new Promise<boolean>((resolve) => {
+    const proc = spawn(BIN_UNAR, unarArgs, { stdio: "ignore" });
+    proc.on("error", () => {});
+    proc.on("close", (code) => resolve(code === 0));
+    proc.on("error", () => resolve(false));
+  });
+
+  const countFiles = async () => {
+    try {
+      const all = await walkDir(tmpOut);
+      return all.length;
+    } catch {
+      return 0;
+    }
+  };
+
+  if (unarOk && (await countFiles()) > 0) return countFiles();
+
+  // ── Fallback: 7z (native RAR5 support via p7zip) ────────────────────────
+  const sevenZArgs = ["x", filePath, `-o${tmpOut}`, "-y", "-bd", ...(password ? [`-p${password}`] : [])];
+  const sevenZOk = await new Promise<boolean>((resolve) => {
+    const proc = spawn(BIN_7Z, sevenZArgs, { stdio: "ignore" });
+    proc.on("error", () => {});
+    proc.on("close", (code) => resolve(code === 0));
+    proc.on("error", () => resolve(false));
+  });
+
+  if (sevenZOk) return countFiles();
+  return 0;
+}
+
+async function extractRarFromFile(
+  filePath: string,
+  domains: string[],
+  result: FullExtractResult,
+  onProgress?: ProgressCallback,
+): Promise<void> {
+  const tmpOut = `${tmpdir()}/logextract-rar-${randomUUID()}`;
+  await fsp.mkdir(tmpOut, { recursive: true });
+
+  try {
+    const extracted = await runRarExtractor(filePath, tmpOut);
+    if (extracted === 0) {
+      result.errors.push(
+        "RAR extraction produced no files — the archive may be password-protected, " +
+        "corrupted, or use an unsupported format (try RAR4 instead of RAR5)."
+      );
+      return;
+    }
+    await scanDir(tmpOut, domains, result, onProgress);
+  } finally {
+    fsp.rm(tmpOut, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Scan an already-extracted RAR directory (e.g. after the URL handler ran unar
+ * in a separate phase). Avoids the double-extraction bug where extractAllFromPath
+ * would try to run unar again on an already-unpacked directory.
+ */
+export async function scanExtractedRarDir(
+  dirPath: string,
+  targetDomains: string[],
+  onProgress?: ProgressCallback,
+): Promise<FullExtractResult> {
+  const domains = targetDomains.map(normalizeDomain).filter(Boolean);
+  const result: FullExtractResult = {
+    cookies: [], passwords: [], cards: [],
+    totalCookies: 0, totalPasswords: 0, totalCards: 0,
+    errors: [],
+  };
+  await scanDir(dirPath, domains, result, onProgress);
+  return result;
+}
+
+// ─── Public API (disk-based — no memory limit) ────────────────────────────────
+
+export async function extractAllFromPath(
+  filePath:      string,
+  fileName:      string,
+  targetDomains: string[],
+  onProgress?:   ProgressCallback,
+): Promise<FullExtractResult> {
+  const domains = targetDomains.map(normalizeDomain).filter(Boolean);
+  const result: FullExtractResult = {
+    cookies: [], passwords: [], cards: [],
+    totalCookies: 0, totalPasswords: 0, totalCards: 0,
+    errors: [],
+  };
+
+  const ext = fileName.toLowerCase().split(".").pop() ?? "";
+
+  if (ext === "rar") {
+    try {
+      await extractRarFromFile(filePath, domains, result, onProgress);
+    } catch (e) {
+      result.errors.push(`Failed to open RAR: ${(e as Error).message}`);
+    }
+  } else {
+    try {
+      await extractZipStreaming(filePath, domains, result, onProgress);
+    } catch (e) {
+      result.errors.push(`Failed to open ZIP: ${(e as Error).message}`);
+    }
+  }
+
+  return result;
+}
+
+// ─── HTTP connect helper ──────────────────────────────────────────────────────
+
+const DL_HEADERS = {
+  "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "identity",
+  "Connection":      "keep-alive",
+  "Upgrade-Insecure-Requests": "1",
+  "Sec-Fetch-Dest":  "document",
+  "Sec-Fetch-Mode":  "navigate",
+  "Sec-Fetch-Site":  "none",
+  "Sec-Fetch-User":  "?1",
+  "Cache-Control":   "max-age=0",
+};
+
+export interface ConnectResult {
+  req:        ClientRequest;
+  res:        IncomingMessage;
+  totalBytes: number;  // full file size (accounts for rangeStart)
+  fileName:   string;
+  isPartial:  boolean; // true when server honoured a Range request (206)
+}
+
+export async function connectToUrl(
+  url:           string,
+  socketTimeout  = 30_000,
+  redirects      = 0,
+  rangeStart     = 0,    // byte offset to resume from (sends Range: bytes=N-)
+): Promise<ConnectResult> {
+  return new Promise((resolve, reject) => {
+    if (redirects > 10) { reject(new Error("Too many redirects")); return; }
+
+    let parsed: URL;
+    try { parsed = new URL(url); }
+    catch { reject(new Error(`Invalid URL: ${url}`)); return; }
+
+    const mod = parsed.protocol === "https:" ? https : http;
+
+    const headers: Record<string, string> = { ...DL_HEADERS };
+    if (rangeStart > 0) headers["Range"] = `bytes=${rangeStart}-`;
+
+    const req = mod.get(
+      { hostname: parsed.hostname, port: parsed.port || undefined, path: parsed.pathname + parsed.search, headers },
+      (res) => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400) {
+          res.resume();
+          const loc = res.headers.location ?? "";
+          const nextUrl = loc.startsWith("http") ? loc : `${parsed.protocol}//${parsed.hostname}${loc}`;
+          connectToUrl(nextUrl, socketTimeout, redirects + 1, rangeStart).then(resolve).catch(reject);
+          return;
+        }
+        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+          res.resume();
+          reject(new Error(`HTTP ${res.statusCode} — server rejected the request.\nUse a direct download link (.zip / .rar).`));
+          return;
+        }
+
+        const isPartial  = res.statusCode === 206;
+        // content-length for a partial response is the remaining bytes; add rangeStart for full size
+        const remBytes   = Number(res.headers["content-length"] ?? 0);
+        const totalBytes = isPartial && rangeStart > 0 ? remBytes + rangeStart : remBytes;
+
+        let fileName = "archive.zip";
+        const cd = (res.headers["content-disposition"] ?? "") as string;
+        const cdMatch = /filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i.exec(cd);
+        if (cdMatch?.[1]) { fileName = decodeURIComponent(cdMatch[1].trim()); }
+        else {
+          const urlName = url.split("?")[0]?.split("/").pop() ?? "";
+          if (/\.(zip|rar)$/i.test(urlName)) fileName = urlName;
+        }
+
+        resolve({ req, res, totalBytes, fileName, isPartial });
+      },
+    );
+
+    req.setTimeout(socketTimeout, () => {
+      req.destroy(new Error(`ETIMEDOUT: no data in ${socketTimeout / 1000}s`));
+    });
+    req.on("error", reject);
+  });
+}
+
+// ─── fetch-based download helper ──────────────────────────────────────────────
+// Uses Node.js built-in fetch (Node 18+) which handles:
+//   • HTTP/1.1, HTTP/2 transparently
+//   • Automatic redirect following
+//   • Better CDN / TLS compatibility
+//   • No undici API version drift issues
+
+export interface DownloadStreamResult {
+  stream:     Readable;
+  totalBytes: number;
+  fileName:   string;
+  abort:      () => void;
+  /** HTTP status code (200 = full file, 206 = partial/range response) */
+  statusCode: number;
+}
+
+export async function downloadStream(
+  url:     string,
+  opts?:   { rangeStart?: number; timeoutMs?: number },
+): Promise<DownloadStreamResult> {
+  const { rangeStart = 0, timeoutMs = 60_000 } = opts ?? {};
+
+  const reqHeaders: Record<string, string> = { ...DL_HEADERS };
+  if (rangeStart > 0) reqHeaders["Range"] = `bytes=${rangeStart}-`;
+
+  // AbortController is used for both the connect timeout and manual abort later
+  const ac = new AbortController();
+
+  // Timeout only covers connecting + getting headers; body stall is handled by callers
+  const connectTimer = setTimeout(() => ac.abort(new Error("ETIMEDOUT: connection timeout")), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method:   "GET",
+      headers:  reqHeaders,
+      redirect: "follow",
+      signal:   ac.signal,
+    });
+  } finally {
+    clearTimeout(connectTimer); // headers received — stop the connect timer
+  }
+
+  if (!response.ok || !response.body) {
+    try { await response.body?.cancel(); } catch {}
+    throw new Error(`HTTP ${response.status} — server rejected the request. Use a direct download link (.zip / .rar).`);
+  }
+
+  const totalBytes = Number(response.headers.get("content-length") ?? 0);
+
+  let fileName = "archive.zip";
+  const cd = response.headers.get("content-disposition") ?? "";
+  const cdMatch = /filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i.exec(cd);
+  if (cdMatch?.[1]) { fileName = decodeURIComponent(cdMatch[1].trim()); }
+  else {
+    const urlName = url.split("?")[0]?.split("/").pop() ?? "";
+    if (/\.(zip|rar)$/i.test(urlName)) fileName = urlName;
+  }
+
+  // Convert WHATWG ReadableStream → Node.js Readable for pipe() compat
+  const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
+
+  return {
+    stream:     nodeStream,
+    totalBytes,
+    fileName,
+    abort:      () => { try { ac.abort(); } catch {} },
+    statusCode: response.status,
+  };
+}
+
+// ─── Streaming ZIP extractor from HTTP (no disk write) ────────────────────────
+
+export async function extractZipFromHttpStream(
+  stream:        IncomingMessage | Readable,
+  targetDomains: string[],
+  onProgress?:   ProgressCallback,
+  signal?:       AbortSignal,
+): Promise<FullExtractResult> {
+  const domains = targetDomains.map(normalizeDomain).filter(Boolean);
+  const result: FullExtractResult = {
+    cookies: [], passwords: [], cards: [],
+    totalCookies: 0, totalPasswords: 0, totalCards: 0,
+    errors: [],
+  };
+
+  let filesScanned = 0;
+  let totalFiles   = 0;
+  let stopped      = false;
+
+  await new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) { stream.destroy(); resolve(); return; }
+
+    signal?.addEventListener("abort", () => {
+      stopped = true;
+      stream.destroy();
+    });
+
+    const pending: Promise<void>[] = [];
+
+    const unzip = new Unzip((file) => {
+      const kind = getFileKind(file.name);
+      if (kind === null) return;
+
+      // Already stopped or at cap — drain this file without processing
+      if (stopped || resultCapped(result)) {
+        result.capped = true;
+        file.ondata = (_err, _chunk, _final) => {};
+        file.start();
+        return;
+      }
+
+      totalFiles++;
+      const chunks: Uint8Array[] = [];
+
+      const p = new Promise<void>((done) => {
+        file.ondata = (_err, chunk, final) => {
+          if (chunk) chunks.push(chunk);
+          if (!final) return;
+
+          // Merge decompressed chunks (fast, synchronous)
+          const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+          const merged   = new Uint8Array(totalLen);
+          let off = 0;
+          for (const c of chunks) { merged.set(c, off); off += c.length; }
+
+          // Defer CPU-heavy decode + parse to its own event loop turn so the
+          // webhook handler can process other Telegram messages between files.
+          setImmediate(() => {
+            // NOTE: do NOT skip processing here even if stopped=true.
+            // By the time we reach setImmediate the file already received its
+            // final chunk — the data is fully buffered and valid.  Discarding
+            // it would silently lose results that the user is waiting for.
+            // New files discovered AFTER the abort are already drained by the
+            // `if (stopped || resultCapped)` guard in the unzip file-open
+            // callback above, so we never start assembling new files post-stop.
+
+            let text: string;
+            try   { text = decode(merged); }
+            catch { done(); return; }
+
+            if (!resultCapped(result)) {
+              if (kind === "cookie") {
+                const cookies = parseCookies(text, domains);
+                if (cookies.length) { result.cookies.push({ sourceFile: file.name, cookies }); result.totalCookies += cookies.length; }
+              } else if (kind === "password") {
+                const entries = parsePasswords(text, domains);
+                if (entries.length) { result.passwords.push({ sourceFile: file.name, entries }); result.totalPasswords += entries.length; }
+              } else if (kind === "cc") {
+                const cards = parseCC(text);
+                result.cards.push(...cards);
+                result.totalCards += cards.length;
+              }
+            } else {
+              result.capped = true;
+            }

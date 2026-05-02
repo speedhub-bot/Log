@@ -5,6 +5,7 @@ Production-grade Telegram bot for extracting cookies from Netscape-format archiv
 ## Features
 
 - **Cookie Extraction** — Extracts domain-specific cookies from `.zip`, `.rar`, `.7z`, `.tar.gz` archives. Routing is by **content (magic bytes)**, not extension, so a `.zip`-named 7z file still extracts cleanly.
+- **Multi-domain Extraction** — Submit several domains at once (e.g. `spotify.com, netflix.com, crunchyroll.com`) and the bot scans the archive once, producing a separate result file per domain. Configurable via `MAX_DOMAINS_PER_EXTRACT` (default `10`).
 - **Live Dashboard** — Per-phase progress: download speed/ETA, extraction file counter (`current/total`), scanning files-per-second, **live cookies-found counter**, and the file currently being processed. Refreshes every 2 s.
 - **Cancel-with-partial-results** — Hit cancel on a running job and the bot still ships whatever cookies it has already found, captioned as partial results.
 - **Large File Support** — All files downloaded via Pyrogram MTProto with **16 parallel chunk transfers** (up to 10 GB for VIP). Configurable via `PYROGRAM_MAX_TRANSMISSIONS`.
