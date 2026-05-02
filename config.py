@@ -28,7 +28,11 @@ ADMIN_ID: int = _int("ADMIN_ID", 5944410248)
 # SESSION_STRING is no longer needed — Pyrogram downloads via bot token directly
 
 # ── Processing ──────────────────────────────────────────────
-MAX_CONCURRENT_JOBS: int = _int("MAX_CONCURRENT_JOBS", 2)
+MAX_CONCURRENT_JOBS: int = _int("MAX_CONCURRENT_JOBS", 4)
+# Per-user concurrent active job caps (how many of *their* jobs may
+# be running at once).  Admin always gets effectively unlimited.
+FREE_USER_MAX_ACTIVE_JOBS: int = _int("FREE_USER_MAX_ACTIVE_JOBS", 1)
+VIP_USER_MAX_ACTIVE_JOBS: int = _int("VIP_USER_MAX_ACTIVE_JOBS", 2)
 FREE_DAILY_LIMIT_GB: int = _int("FREE_DAILY_LIMIT_GB", 2)
 FREE_DAILY_LIMIT_BYTES: int = FREE_DAILY_LIMIT_GB * 1024 ** 3
 FREE_MAX_FILE_BYTES: int = 2 * 1024 ** 3          # 2 GB

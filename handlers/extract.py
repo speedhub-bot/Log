@@ -118,14 +118,23 @@ async def extract_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     text = (
-        "\U0001f310 Enter the domain to extract cookies for:\n"
-        "Example: spotify.com, netflix.com"
+        "\U0001f310 Enter the domain(s) to extract cookies for.\n"
+        "You can list several at once \u2014 separated by commas, "
+        "spaces or newlines:\n"
+        "<code>spotify.com</code>\n"
+        "<code>netflix.com, hbo.com</code>\n"
+        "<code>amazon.com paypal.com discord.com</code>\n"
+        "\nEach domain gets its own \u2728 .zip in the result."
     )
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, reply_markup=_cancel_kb())
+        await update.callback_query.edit_message_text(
+            text, parse_mode="HTML", reply_markup=_cancel_kb(),
+        )
     else:
-        await update.message.reply_text(text, reply_markup=_cancel_kb())  # type: ignore[union-attr]
+        await update.message.reply_text(  # type: ignore[union-attr]
+            text, parse_mode="HTML", reply_markup=_cancel_kb(),
+        )
     return DOMAIN
 
 
@@ -137,19 +146,46 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
 
     raw = (update.message.text or "").strip()
-    valid, result = validate_domain(raw)
-    if not valid:
-        await update.message.reply_text(f"\u274c {result}", reply_markup=_cancel_kb())
-        return DOMAIN
-
-    # Check blacklist
-    if await db.is_domain_blacklisted(result):
+    # Multi-domain support: split on commas / whitespace / newlines.
+    raw_tokens = [t for t in re.split(r"[\s,;]+", raw) if t]
+    if not raw_tokens:
         await update.message.reply_text(
-            "\u274c This domain is blacklisted.", reply_markup=_cancel_kb()
+            "\u274c Please provide at least one domain.",
+            reply_markup=_cancel_kb(),
         )
         return DOMAIN
 
-    context.user_data["extract_domain"] = result  # type: ignore[index]
+    domains: list[str] = []
+    for tok in raw_tokens:
+        valid, result = validate_domain(tok)
+        if not valid:
+            await update.message.reply_text(
+                f"\u274c {result}", reply_markup=_cancel_kb(),
+            )
+            return DOMAIN
+        if await db.is_domain_blacklisted(result):
+            await update.message.reply_text(
+                f"\u274c Domain blacklisted: {result}",
+                reply_markup=_cancel_kb(),
+            )
+            return DOMAIN
+        if result not in domains:
+            domains.append(result)
+
+    # Hard cap to keep one job from spamming hundreds of zips.
+    MAX_DOMAINS_PER_JOB = 20
+    if len(domains) > MAX_DOMAINS_PER_JOB:
+        await update.message.reply_text(
+            f"\u274c Too many domains ({len(domains)}). Max "
+            f"{MAX_DOMAINS_PER_JOB} per job.",
+            reply_markup=_cancel_kb(),
+        )
+        return DOMAIN
+
+    # Keep the first as the canonical (used for filenames + DB).
+    result = domains[0]
+    context.user_data["extract_domain"] = result          # type: ignore[index]
+    context.user_data["extract_domains"] = domains        # type: ignore[index]
 
     is_admin = user.id == config.ADMIN_ID
     remaining = await db.get_remaining_quota(user.id)
@@ -165,9 +201,14 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         max_file = "2 GB"
 
+    domain_summary = (
+        f"{len(domains)} domains: " + ", ".join(domains)
+        if len(domains) > 1 else result
+    )
     text = (
-        f"\U0001f4c1 Now send your archive file — OR paste a direct "
-        f"download URL (.zip / .rar).\n"
+        f"\U0001f4c1 Domain(s): {domain_summary}\n\n"
+        f"Now send your archive file — OR paste a direct download "
+        f"URL (.zip / .rar).\n"
         f"Supported: .zip .rar .7z .tar.gz\n"
         f"Your limit: {limit_text} remaining today\n"
         f"Max file size: {max_file}"
@@ -229,7 +270,8 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             )
             return ConversationHandler.END
 
-    domain = context.user_data.get("extract_domain", "unknown")  # type: ignore[union-attr]
+    domain = context.user_data.get("extract_domain", "unknown")          # type: ignore[union-attr]
+    domains = context.user_data.get("extract_domains", [domain])          # type: ignore[union-attr]
 
     # Consume quota (no-op for admin)
     if not is_admin:
@@ -252,7 +294,7 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     async def _worker() -> None:
         await _process_job(
-            update, context, job_id, user.id, domain,
+            update, context, job_id, user.id, domains,
             source_ref, progress_msg, progress,
         )
 
@@ -264,6 +306,11 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         user_id=user.id,
         is_vip=is_vip_flag,
         coro_factory=_worker,
+        user_max_active=(
+            None if is_admin
+            else (config.VIP_USER_MAX_ACTIVE_JOBS if is_vip_flag
+                  else config.FREE_USER_MAX_ACTIVE_JOBS)
+        ),
     )
     assert _job_queue is not None
     pos = await _job_queue.enqueue(item)
@@ -307,7 +354,8 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     is_admin = user.id == config.ADMIN_ID
     vip = await db.is_vip(user.id)
-    domain = context.user_data.get("extract_domain", "unknown")  # type: ignore[union-attr]
+    domain = context.user_data.get("extract_domain", "unknown")          # type: ignore[union-attr]
+    domains = context.user_data.get("extract_domains", [domain])          # type: ignore[union-attr]
 
     # Assume unknown size for URLs; the worker will enforce caps against
     # the real content-length it sees during download.
@@ -324,7 +372,7 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     async def _worker() -> None:
         await _process_job(
-            update, context, job_id, user.id, domain,
+            update, context, job_id, user.id, domains,
             ("url", raw, file_name), progress_msg, progress,
         )
 
@@ -334,6 +382,11 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         user_id=user.id,
         is_vip=vip,
         coro_factory=_worker,
+        user_max_active=(
+            None if is_admin
+            else (config.VIP_USER_MAX_ACTIVE_JOBS if vip
+                  else config.FREE_USER_MAX_ACTIVE_JOBS)
+        ),
     )
     assert _job_queue is not None
     pos = await _job_queue.enqueue(item)
@@ -352,11 +405,15 @@ async def _process_job(
     context: ContextTypes.DEFAULT_TYPE,
     job_id: int,
     user_id: int,
-    domain: str,
+    domains: "list[str] | str",
     original_msg,
     progress_msg,
     progress: ExtractionProgress,
 ) -> None:
+    # Backward-compat: legacy callers may pass a single string.
+    if isinstance(domains, str):
+        domains = [domains]
+    domain = domains[0] if domains else "unknown"
     """Download, extract, send results — runs inside the queue worker."""
     start_ts = time.monotonic()
     temp_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
@@ -388,9 +445,9 @@ async def _process_job(
             context, user_id, archive_path, progress_msg, job_id,
         )
 
-        # Extract
+        # Extract — multi-domain pass.
         result = await run_extraction_async(
-            archive_path, domain, progress, password=password,
+            archive_path, domains, progress, password=password,
         )
 
         updater_task.cancel()
@@ -464,9 +521,20 @@ async def _process_job(
             "\u26a0\ufe0f Cancelled \u2014 partial results delivered"
             if result.partial else "\u2705 Extraction Complete!"
         )
+        # Build the per-domain breakdown when multiple domains were
+        # requested; collapse to a single line for the common case.
+        if len(domains) > 1 and result.cookies_per_domain:
+            domain_block_lines = ["\U0001f310 Domains:"]
+            for d in domains:
+                domain_block_lines.append(
+                    f"   \u2022 {d}: {result.cookies_per_domain.get(d, 0):,} cookies"
+                )
+            domain_block = "\n".join(domain_block_lines)
+        else:
+            domain_block = f"\U0001f310 Domain: {domain}"
         summary = (
             f"{header}\n\n"
-            f"\U0001f310 Domain: {domain}\n"
+            f"{domain_block}\n"
             f"\U0001f36a Cookies found: {result.cookies_found:,}\n"
             f"\U0001f4c1 Files scanned: {result.files_scanned:,}\n"
             f"\U0001f4e6 Archive size: {bytes_human(file_size)}\n"
@@ -485,6 +553,27 @@ async def _process_job(
             ]),
         )
 
+    except asyncio.CancelledError:
+        # Triggered by the cancel button while the worker was inside an
+        # awaitable (download / extraction). Mark the job cancelled and
+        # confirm in chat so the user knows the abort actually landed.
+        logger.info("Job {} cancelled by user (CancelledError)", job_id)
+        await db.update_job(
+            job_id, status="cancelled",
+            error_message="Cancelled by user",
+            completed_at=db._now(),
+            duration_seconds=time.monotonic() - start_ts,
+        )
+        try:
+            await progress_msg.edit_text(
+                "\u274c Job cancelled.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f50d Extract Again", callback_data="extract"),
+                     InlineKeyboardButton("\U0001f3e0 Home", callback_data="home")],
+                ]),
+            )
+        except Exception:
+            pass
     except Exception as exc:
         logger.exception("Job {} failed unexpectedly", job_id)
         await db.update_job(
@@ -819,33 +908,92 @@ async def cancel_extract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cancel_job_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancel a running/queued job."""
+    """Cancel a running/queued job.
+
+    Owner-only. The button payload includes the job id; we set
+    ``progress.cancelled``, the download / extraction loop checks it on
+    the next tick (or immediately, via ``StopTransmission`` from the
+    pyrogram progress callback) and unwinds.
+    """
     query = update.callback_query
     if query is None:
         return
-    await query.answer()
 
     data = query.data or ""
     try:
         job_id = int(data.split("_")[-1])
     except (ValueError, IndexError):
+        await query.answer("Bad cancel payload.", show_alert=False)
         return
 
-    # Cancel in queue
+    # Verify the user owns this job before letting them kill it.
+    job_row = await db.get_job(job_id)
+    user = update.effective_user
+    if job_row is None:
+        await query.answer("Job not found.", show_alert=False)
+        try:
+            await query.edit_message_text("\u274c Job not found.")
+        except Exception:
+            pass
+        return
+    job_owner = job_row["user_id"] if "user_id" in job_row.keys() else None  # type: ignore[index]
+    is_admin = user is not None and user.id == config.ADMIN_ID
+    if user is None or (job_owner != user.id and not is_admin):
+        await query.answer("Not your job.", show_alert=True)
+        return
+
+    await query.answer("Cancelling\u2026", show_alert=False)
+
+    # Already done?
+    status = job_row["status"] if "status" in job_row.keys() else ""  # type: ignore[index]
+    if status in {"done", "failed", "cancelled"}:
+        try:
+            await query.edit_message_text(
+                f"\u2139\ufe0f Job already {status}."
+            )
+        except Exception:
+            pass
+        return
+
+    # Cancel in queue (still waiting)
     if _job_queue and _job_queue.cancel(job_id):
-        await db.update_job(job_id, status="cancelled", completed_at=db._now())
-        await query.edit_message_text("\u274c Job cancelled (was queued).")
+        await db.update_job(
+            job_id, status="cancelled",
+            error_message="Cancelled by user (was queued)",
+            completed_at=db._now(),
+        )
+        try:
+            await query.edit_message_text(
+                "\u274c Job cancelled (was queued).",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f50d Extract Again", callback_data="extract"),
+                     InlineKeyboardButton("\U0001f3e0 Home", callback_data="home")],
+                ]),
+            )
+        except Exception:
+            pass
         return
 
-    # Cancel running job
+    # Cancel running job — flip the flag; the worker loop / StopTransmission
+    # handler will edit the message to "Job cancelled." on the way out.
     prog = _active_progress.get(job_id)
     if prog:
         prog.cancelled = True
-        await db.update_job(job_id, status="cancelled", completed_at=db._now())
-        await query.edit_message_text("\u274c Cancelling job...")
+        try:
+            await query.edit_message_text(
+                "\u274c Cancelling\u2026 (will stop on next tick)",
+                reply_markup=_cancel_job_kb(job_id),
+            )
+        except Exception:
+            pass
         return
 
-    await query.edit_message_text("\u274c Job not found or already completed.")
+    # Job is neither queued nor active — most likely already finished
+    # between the user's tap and our handler running.
+    try:
+        await query.edit_message_text("\u2139\ufe0f Job already finished.")
+    except Exception:
+        pass
 
 
 # ── Register ───────────────────────────────────────────────
