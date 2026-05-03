@@ -31,16 +31,34 @@ from services.extractor import ExtractionProgress
 _pyro_client: Client | None = None
 _pyro_started: bool = False
 
+# Minimum gap between dashboard log lines (separate from the in-chat
+# 2 MB-boundary edits, which are throttled independently).
 MIN_EDIT_INTERVAL = 1.0
 
-# Parallel chunk transfers within a single download — higher = faster on
-# high-bandwidth servers. Pyrogram internally tops out at 50; bot-token
-# sessions usually saturate somewhere between 16 and 32.  Default 32
-# gives a meaningful win on big files (>500 MB) over the previous 16
-# without triggering server-side rate-limits on a bot connection.
+# How often we edit the user-facing status message during a download.
+# Pyrogram fires `_progress_cb` on every chunk (~512 KB) which is far
+# more often than Telegram's per-chat edit budget, so we throttle by
+# bytes (every ~2 MB) AND by wall-clock seconds (>= 1.5 s apart) to
+# stay well within rate limits while still feeling responsive.
+LIVE_MSG_EDIT_BYTES = 2 * 1024 * 1024
+LIVE_MSG_EDIT_INTERVAL = 1.5
+
+# Parallel chunk transfers within a single download. The user-tuned
+# value is 10 — Pyrogram's bot-token sessions usually saturate well
+# below this on most ISPs, so going higher rarely helps and risks
+# server-side back-pressure.
 MAX_CONCURRENT_TRANSMISSIONS = int(
-    os.getenv("PYROGRAM_MAX_TRANSMISSIONS", "32")
+    os.getenv("PYROGRAM_MAX_TRANSMISSIONS", "10")
 )
+
+# Worker thread pool inside Pyrogram (chunk decryption + write back).
+# 16 keeps tgcrypto saturated without thrashing the event loop.
+PYROGRAM_WORKERS = int(os.getenv("PYROGRAM_WORKERS", "16"))
+
+# How long Pyrogram silently absorbs a FloodWait before raising it. 60s
+# means most rate-limit hiccups recover transparently without the
+# extraction job failing.
+PYROGRAM_SLEEP_THRESHOLD = int(os.getenv("PYROGRAM_SLEEP_THRESHOLD", "60"))
 
 
 def _check_tgcrypto_loaded() -> None:
@@ -59,7 +77,16 @@ def _check_tgcrypto_loaded() -> None:
 
 
 async def _get_pyrogram() -> Client:
-    """Return a started Pyrogram bot client (singleton)."""
+    """Return a started Pyrogram bot client (singleton).
+
+    Configured for high-throughput downloads:
+      * ``workers``                       — internal thread pool for
+                                            chunk decrypt + disk write.
+      * ``max_concurrent_transmissions``  — parallel chunk fetches per
+                                            download.
+      * ``sleep_threshold``               — silently absorb FloodWait
+                                            replies up to this many sec.
+    """
     global _pyro_client, _pyro_started
     if _pyro_client is None:
         _pyro_client = Client(
@@ -69,15 +96,20 @@ async def _get_pyrogram() -> Client:
             bot_token=config.BOT_TOKEN,
             in_memory=True,
             no_updates=True,
+            workers=PYROGRAM_WORKERS,
             max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
+            sleep_threshold=PYROGRAM_SLEEP_THRESHOLD,
         )
     if not _pyro_started:
         _check_tgcrypto_loaded()
         await _pyro_client.start()
         _pyro_started = True
         logger.info(
-            "Pyrogram download client started (concurrent_transmissions={})",
+            "Pyrogram download client started "
+            "(workers={}, concurrent_transmissions={}, sleep_threshold={}s)",
+            PYROGRAM_WORKERS,
             MAX_CONCURRENT_TRANSMISSIONS,
+            PYROGRAM_SLEEP_THRESHOLD,
         )
     return _pyro_client
 
@@ -91,11 +123,51 @@ async def disconnect_pyrogram() -> None:
         logger.info("Pyrogram download client stopped")
 
 
+def _format_live_progress(current: int, total: int, start_ts: float) -> str:
+    """Render the user-facing live download text (the format requested
+    by the bot owner — speed in MB/s, percent, MB-of-MB)."""
+    elapsed = max(time.monotonic() - start_ts, 0.001)
+    speed_mbps = (current / elapsed) / (1024 * 1024)
+    percent = (current / total * 100) if total > 0 else 0.0
+    downloaded_mb = current / (1024 * 1024)
+    total_mb = total / (1024 * 1024) if total > 0 else 0.0
+    return (
+        "\u2b07\ufe0f <b>Downloading\u2026</b>\n"
+        f"Progress: {percent:.1f}%\n"
+        f"\U0001f4e6 {downloaded_mb:.1f} MB / {total_mb:.1f} MB\n"
+        f"\u26a1 Speed: {speed_mbps:.1f} MB/s"
+    )
+
+
+async def _edit_live_progress(
+    status_msg,
+    current: int,
+    total: int,
+    start_ts: float,
+    cancel_kb,
+) -> None:
+    """Edit *status_msg* with the live download text, swallowing the
+    inevitable ``MessageNotModified`` / network errors."""
+    if status_msg is None:
+        return
+    text = _format_live_progress(current, total, start_ts)
+    try:
+        await status_msg.edit_text(
+            text, parse_mode="HTML", reply_markup=cancel_kb,
+        )
+    except Exception:
+        # Telegram rejects edits that produce identical text, plus we
+        # can race with the dashboard updater. Both are harmless.
+        pass
+
+
 async def download_file(
     message: Message,
     dest_path: str,
     progress: ExtractionProgress,
     max_retries: int = 3,
+    status_msg=None,
+    cancel_kb=None,
 ) -> str:
     """
     Download the document attached to *message* into *dest_path*.
@@ -124,11 +196,14 @@ async def download_file(
     progress.download_total = file_size
     progress.download_current = 0
     progress.download_start = time.monotonic()
+    progress.live_download_msg = status_msg is not None
 
     logger.info(
         "Downloading {} ({:.1f} MB) via Pyrogram MTProto "
-        "(parallel_transmissions={})",
-        file_name, file_size / 1e6, MAX_CONCURRENT_TRANSMISSIONS,
+        "(workers={}, parallel_transmissions={}, sleep_threshold={}s)",
+        file_name, file_size / 1e6,
+        PYROGRAM_WORKERS, MAX_CONCURRENT_TRANSMISSIONS,
+        PYROGRAM_SLEEP_THRESHOLD,
     )
     client = await _get_pyrogram()
 
@@ -145,6 +220,8 @@ async def download_file(
     except ImportError:
         FloodWait = None  # type: ignore[assignment]
 
+    main_loop = asyncio.get_running_loop()
+
     attempt = 0
     while True:
         attempt += 1
@@ -152,9 +229,17 @@ async def download_file(
         last_log = start_ts
         last_bytes = 0
         peak_mbps = 0.0
+        # Bytes-thresholded throttle for the in-chat live edit. We refuse
+        # to fire another edit until at least LIVE_MSG_EDIT_BYTES have
+        # been transferred AND LIVE_MSG_EDIT_INTERVAL seconds have
+        # elapsed since the last one.
+        last_edit_bytes = 0
+        last_edit_ts = 0.0
+        edit_inflight = False
 
         def _progress_cb(current: int, total: int) -> None:
             nonlocal last_log, last_bytes, peak_mbps
+            nonlocal last_edit_bytes, last_edit_ts, edit_inflight
             progress.download_current = current
             progress.download_total = total
             now = time.monotonic()
@@ -178,6 +263,47 @@ async def download_file(
                     (current / total * 100) if total else 0,
                     inst_mbps, avg_mbps, peak_mbps,
                 )
+
+            # In-chat live edit: every 2 MB and at most once / 1.5 s.
+            # We schedule the coroutine on the bot's loop because this
+            # callback runs inside Pyrogram's executor.
+            if (
+                status_msg is not None
+                and not edit_inflight
+                and (current - last_edit_bytes) >= LIVE_MSG_EDIT_BYTES
+                and (now - last_edit_ts) >= LIVE_MSG_EDIT_INTERVAL
+            ):
+                last_edit_bytes = current
+                last_edit_ts = now
+                edit_inflight = True
+
+                def _done(_task):
+                    nonlocal edit_inflight
+                    edit_inflight = False
+
+                try:
+                    coro = _edit_live_progress(
+                        status_msg, current, total, start_ts, cancel_kb,
+                    )
+                    # Pyrogram fires this callback inside the bot's
+                    # event loop. ``call_soon_threadsafe`` is the safe
+                    # cross-thread variant if Pyrogram ever moves to an
+                    # executor — it works either way.
+                    if main_loop.is_running():
+                        try:
+                            asyncio.get_running_loop()
+                            task = asyncio.ensure_future(coro)
+                        except RuntimeError:
+                            task = asyncio.run_coroutine_threadsafe(
+                                coro, main_loop,
+                            )
+                    else:
+                        task = asyncio.run_coroutine_threadsafe(
+                            coro, main_loop,
+                        )
+                    task.add_done_callback(_done)
+                except Exception:
+                    edit_inflight = False
 
         try:
             path = await client.download_media(
@@ -206,6 +332,7 @@ async def download_file(
     elapsed = time.monotonic() - start_ts
     speed_mbps = (file_size / max(elapsed, 0.001)) / 1e6
     progress.download_current = progress.download_total
+    progress.live_download_msg = False
     logger.info(
         "Download complete: {} ({:.1f} MB in {:.1f}s, avg {:.1f} MB/s, "
         "peak {:.1f} MB/s)",
@@ -256,12 +383,16 @@ async def download_from_url(
     file_name_hint: str = "",
     chunk_size: int = 512 * 1024,
     timeout: float = 60.0,
+    status_msg=None,
+    cancel_kb=None,
 ) -> str:
     """Stream-download *url* into *dest_path* using aiohttp.
 
     The Content-Disposition header is honoured for the final filename.
     Updates ``progress.download_current`` / ``download_total`` so the
     live dashboard can render the same way as a Pyrogram download.
+    When *status_msg* is supplied, the message is edited every ~2 MB
+    with the live download dashboard (speed in MB/s, percent, total).
     """
     # Import aiohttp lazily — it isn't used on every code path and
     # Railway may not have it pre-installed on older images.
@@ -277,6 +408,7 @@ async def download_from_url(
     progress.download_current = 0
     progress.download_total = 0
     progress.download_start = time.monotonic()
+    progress.live_download_msg = status_msg is not None
 
     os.makedirs(dest_path, exist_ok=True)
 
@@ -307,6 +439,8 @@ async def download_from_url(
             out_path = os.path.join(dest_path, file_name)
             start_ts = time.monotonic()
             last_log = start_ts
+            last_edit_bytes = 0
+            last_edit_ts = 0.0
             downloaded = 0
             with open(out_path, "wb") as fh:
                 async for chunk in resp.content.iter_chunked(chunk_size):
@@ -330,12 +464,29 @@ async def download_from_url(
                             downloaded, total or "?", speed,
                         )
                         last_log = now
+                    # Live in-chat progress edits — every ~2 MB and at
+                    # most once per 1.5 s, matching the Pyrogram path.
+                    if (
+                        status_msg is not None
+                        and (downloaded - last_edit_bytes) >= LIVE_MSG_EDIT_BYTES
+                        and (now - last_edit_ts) >= LIVE_MSG_EDIT_INTERVAL
+                    ):
+                        last_edit_bytes = downloaded
+                        last_edit_ts = now
+                        await _edit_live_progress(
+                            status_msg,
+                            downloaded,
+                            total or downloaded,
+                            start_ts,
+                            cancel_kb,
+                        )
 
     elapsed = time.monotonic() - start_ts
     mb = downloaded / 1e6
     speed = mb / max(elapsed, 0.001)
     progress.download_total = downloaded
     progress.download_current = downloaded
+    progress.live_download_msg = False
     logger.info(
         "URL download complete: {} ({:.1f} MB in {:.1f}s, {:.1f} MB/s)",
         out_path, mb, elapsed, speed,

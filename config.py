@@ -22,8 +22,11 @@ def _str(key: str, default: str) -> str:
 
 # ── Telegram ────────────────────────────────────────────────
 BOT_TOKEN: str = _str("BOT_TOKEN", "8482556356:AAFYFKTA_FFFpAaz2tRsgKtalbOrwptPkVY")
-API_ID: int = _int("API_ID", 31206680)
-API_HASH: str = _str("API_HASH", "39d0b0430309434e7ab02ab1742dd170")
+# Default to Telegram Desktop's public api_id/api_hash, which often
+# routes through faster MTProto endpoints than fresh test credentials.
+# Override via env if you have your own production credentials.
+API_ID: int = _int("API_ID", 2040)
+API_HASH: str = _str("API_HASH", "b18441a1ff607e10a989891a5462e627")
 ADMIN_ID: int = _int("ADMIN_ID", 5944410248)
 # SESSION_STRING is no longer needed — Pyrogram downloads via bot token directly
 

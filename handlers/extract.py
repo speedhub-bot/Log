@@ -38,6 +38,7 @@ from services.extractor import (
     guess_archive_password_async,
     probe_encrypted_entries_async,
     run_extraction_async,
+    try_archive_password_async,
 )
 from services.queue import JobQueue, QueueItem, priority_for
 from utils.formatting import bytes_human, progress_bar, seconds_human, time_until
@@ -58,9 +59,24 @@ _active_progress: Dict[int, ExtractionProgress] = {}
 _pending_passwords: Dict[int, "asyncio.Future[Optional[str]]"] = {}
 
 # How long to wait for the user to reply with a password before we
-# auto-skip and proceed with ``-p-``. Keeps stuck jobs from pinning a
-# queue worker forever.
-PASSWORD_PROMPT_TIMEOUT = 300.0  # 5 minutes
+# give up and cancel the job. Per-attempt — every wrong guess restarts
+# the timer so the user gets a fresh chance to retry.
+PASSWORD_PROMPT_TIMEOUT = 60.0  # 60 seconds, per-attempt
+
+# How many wrong-password retries we allow before we stop asking and
+# cancel the job. The 60-second-per-attempt timer also still applies.
+PASSWORD_MAX_ATTEMPTS = 5
+
+# Sentinel returned by :func:`_maybe_prompt_for_password` to signal
+# "cancel the whole extraction job" — distinct from ``None`` (which
+# means "skip encrypted, extract the rest").
+class _PasswordCancel:
+    __slots__ = ()
+    def __repr__(self) -> str:  # pragma: no cover
+        return "<PasswordCancel>"
+
+
+PASSWORD_CANCEL = _PasswordCancel()
 
 
 # ── Rescan window ──────────────────────────────────────────
@@ -653,16 +669,46 @@ async def _process_job(
         ):
             _, url_value, name_hint = original_msg
             archive_path = await download_from_url(
-                url_value, temp_dir, progress, file_name_hint=name_hint,
+                url_value,
+                temp_dir,
+                progress,
+                file_name_hint=name_hint,
+                status_msg=progress_msg,
+                cancel_kb=_cancel_job_kb(job_id),
             )
             password = await _maybe_prompt_for_password(
                 context, user_id, archive_path, progress_msg, job_id,
             )
         else:
-            archive_path = await download_file(original_msg, temp_dir, progress)
+            archive_path = await download_file(
+                original_msg,
+                temp_dir,
+                progress,
+                status_msg=progress_msg,
+                cancel_kb=_cancel_job_kb(job_id),
+            )
             password = await _maybe_prompt_for_password(
                 context, user_id, archive_path, progress_msg, job_id,
             )
+
+        # Password-cancel sentinel: caller asked us to abort the whole
+        # job because the user didn't reply to the password prompt
+        # within the timeout (or burned all retries).
+        if password is PASSWORD_CANCEL:
+            updater_task.cancel()
+            try:
+                await updater_task
+            except asyncio.CancelledError:
+                pass
+            duration = time.monotonic() - start_ts
+            await db.update_job(
+                job_id,
+                status="cancelled",
+                error_message="Cancelled \u2014 password not provided",
+                completed_at=db._now(),
+                duration_seconds=duration,
+            )
+            return
 
         # Extract — run_extraction_async accepts a single domain string
         # or a list of domains for multi-target jobs.
@@ -871,18 +917,159 @@ async def _process_job(
                     break  # all chunks share the same output dir
 
 
+def _password_prompt_kb(job_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "\u23ed Skip encrypted", callback_data=f"skip_pw_{job_id}"
+        ),
+        InlineKeyboardButton(
+            "\u274c Cancel Job", callback_data=f"cancel_job_{job_id}"
+        ),
+    ]])
+
+
+def _build_password_prompt(
+    encrypted: List[str],
+    attempt: int,
+    last_failed: Optional[str],
+    timeout_secs: int,
+) -> str:
+    """Format the in-chat password prompt text."""
+    sample = ", ".join(encrypted[:3])
+    if len(encrypted) > 3:
+        sample += f", +{len(encrypted) - 3} more"
+
+    if attempt == 1:
+        header = (
+            f"\U0001f510 This archive has {len(encrypted)} "
+            f"password-protected file(s):\n<code>{sample}</code>"
+        )
+        body = (
+            "I'm trying common passwords in the background. If you know "
+            "the password, <b>just type it now</b> — I'll try yours "
+            "first and skip the rest of the list."
+        )
+    else:
+        last_safe = (last_failed or "").replace("<", "&lt;").replace(">", "&gt;")
+        header = (
+            f"\u274c Password <code>{last_safe}</code> didn't work."
+        )
+        body = (
+            f"Try another password (attempt {attempt}/{PASSWORD_MAX_ATTEMPTS}), "
+            "or tap Skip to extract only the unencrypted files."
+        )
+
+    return (
+        f"{header}\n\n{body}\n\n"
+        f"\u23f1 Auto-cancel in <b>{timeout_secs} s</b> if no reply."
+    )
+
+
+async def _wait_for_password_or_guess(
+    user_id: int,
+    guess_task: "asyncio.Task[Optional[str]]",
+    timeout: float,
+) -> "tuple[str, Optional[str]]":
+    """Race three signals over a *timeout*-second window:
+
+    - The catch-all chat handler resolves the user's pending future
+      with their typed password (or ``None`` for ``/skip``).
+    - The background ``guess_task`` finishes with an auto-detected
+      password (or ``None`` if the candidate list exhausted).
+    - The wall-clock timeout elapses.
+
+    Returns one of:
+
+    - ``("guess", password)``  — auto-guess hit; use it.
+    - ``("user", password)``   — user typed *password*.
+    - ``("user", None)``       — user pressed Skip / typed ``/skip``.
+    - ``("timeout", None)``    — no reply within *timeout* seconds.
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Optional[str]] = loop.create_future()
+    prev = _pending_passwords.get(user_id)
+    if prev is not None and not prev.done():
+        prev.cancel()
+    _pending_passwords[user_id] = fut
+
+    try:
+        # Fast-path: auto-guess might already be done from a previous
+        # iteration. If it returned a hit, take it immediately.
+        if guess_task.done():
+            try:
+                hit = guess_task.result()
+            except Exception:
+                hit = None
+            if hit is not None:
+                fut.cancel()
+                return ("guess", hit)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ("timeout", None)
+            wait_targets: "set[asyncio.Future]" = {fut}
+            if not guess_task.done():
+                wait_targets.add(guess_task)
+            done, _pending = await asyncio.wait(
+                wait_targets,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                return ("timeout", None)
+
+            if guess_task in done:
+                try:
+                    hit = guess_task.result()
+                except Exception:
+                    hit = None
+                if hit is not None:
+                    if not fut.done():
+                        fut.cancel()
+                    return ("guess", hit)
+                # Auto-guess exhausted with None — keep waiting for
+                # the user's typed password until the deadline.
+
+            if fut in done:
+                try:
+                    user_pw = fut.result()
+                except (asyncio.CancelledError, Exception):
+                    return ("timeout", None)
+                return ("user", user_pw)
+    finally:
+        # Always drop our slot so a stray future doesn't trap a later
+        # password reply for a different job.
+        if _pending_passwords.get(user_id) is fut:
+            _pending_passwords.pop(user_id, None)
+
+
 async def _maybe_prompt_for_password(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
     archive_path: str,
     progress_msg,
     job_id: int,
-) -> "str | None":
-    """Probe *archive_path* for encrypted entries. If any exist, ask the
-    user for the archive password in chat and wait for their reply.
+):
+    """Probe *archive_path* for encrypted entries. If any exist:
 
-    Returns the password to use for extraction, or ``None`` to proceed
-    without one (user chose /skip or didn't reply in time).
+    - Kicks off the common-password auto-guess in the background.
+    - Immediately prompts the user to type the archive password,
+      with a visible 60-second auto-cancel timer.
+    - If the user replies, we test their password right away (we don't
+      keep walking the common-password list — fast feedback wins).
+    - If their password fails, we re-prompt and the 60-second timer
+      restarts (up to ``PASSWORD_MAX_ATTEMPTS`` retries).
+    - If the auto-guess hits before the user types anything, we use it.
+    - If the user doesn't reply within 60 s, the job is cancelled.
+
+    Returns one of:
+
+    - ``str``                  — password to use for extraction.
+    - ``None``                 — extract only the unencrypted entries
+                                 (user pressed Skip).
+    - ``PASSWORD_CANCEL``      — timed out; caller should abort the job.
     """
     try:
         encrypted = await probe_encrypted_entries_async(archive_path)
@@ -893,111 +1080,129 @@ async def _maybe_prompt_for_password(
     if not encrypted:
         return None
 
-    # --- Auto-guess before prompting the user ----------------------
-    # Most stealer-log dumps are locked with a common password (1234,
-    # the channel @handle, etc). Try the candidate list silently — if
-    # anything hits we extract with no user intervention.
-    try:
-        await progress_msg.edit_text(
-            "\U0001f510 Encrypted archive detected — "
-            "trying common passwords\u2026",
-            reply_markup=_cancel_job_kb(job_id),
-        )
-    except Exception:
-        pass
-
-    try:
-        guessed = await guess_archive_password_async(archive_path)
-    except Exception:
-        logger.exception("Password auto-guess crashed on {}", archive_path)
-        guessed = None
-
-    if guessed is not None:
-        try:
-            await progress_msg.edit_text(
-                f"\U0001f513 Password auto-detected: <code>{guessed}</code>\n"
-                "Extracting\u2026",
-                parse_mode="HTML",
-                reply_markup=_cancel_job_kb(job_id),
-            )
-        except Exception:
-            pass
-        return guessed
-
-    # Show up to three sample names so the user knows what's locked.
-    sample = ", ".join(encrypted[:3])
-    if len(encrypted) > 3:
-        sample += f", +{len(encrypted) - 3} more"
-    text = (
-        f"\U0001f510 This archive has {len(encrypted)} password-protected "
-        f"file(s):\n<code>{sample}</code>\n\n"
-        "I couldn't auto-guess the password. Reply with the archive "
-        "password to extract everything, or tap <b>Skip</b> to extract "
-        "only the unencrypted files."
+    # Background auto-guess. Runs concurrently with the user prompt;
+    # we cancel it as soon as we have a winning password from either
+    # source.
+    guess_task: "asyncio.Task[Optional[str]]" = asyncio.create_task(
+        guess_archive_password_async(archive_path),
+        name=f"guess_pw_{job_id}",
     )
-    try:
-        await progress_msg.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "\u23ed Skip encrypted", callback_data=f"skip_pw_{job_id}"
-                ),
-                InlineKeyboardButton(
-                    "\u274c Cancel Job", callback_data=f"cancel_job_{job_id}"
-                ),
-            ]]),
-        )
-    except Exception:
-        logger.exception("Failed to edit progress msg for password prompt")
-
-    # Create the waiter and let the catch-all message handler fill it.
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future[Optional[str]] = loop.create_future()
-    # Replace any previous pending request for this user — last one wins.
-    prev = _pending_passwords.get(user_id)
-    if prev is not None and not prev.done():
-        prev.cancel()
-    _pending_passwords[user_id] = fut
 
     try:
-        password = await asyncio.wait_for(fut, timeout=PASSWORD_PROMPT_TIMEOUT)
-    except asyncio.TimeoutError:
+        last_failed: Optional[str] = None
+        for attempt in range(1, PASSWORD_MAX_ATTEMPTS + 1):
+            timeout_secs = int(PASSWORD_PROMPT_TIMEOUT)
+            prompt_text = _build_password_prompt(
+                encrypted, attempt, last_failed, timeout_secs,
+            )
+            try:
+                await progress_msg.edit_text(
+                    prompt_text,
+                    parse_mode="HTML",
+                    reply_markup=_password_prompt_kb(job_id),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to edit progress msg for password prompt",
+                )
+
+            kind, value = await _wait_for_password_or_guess(
+                user_id, guess_task, PASSWORD_PROMPT_TIMEOUT,
+            )
+
+            if kind == "timeout":
+                logger.info(
+                    "Password prompt timed out for user {} job {} after "
+                    "attempt {}; cancelling job.",
+                    user_id, job_id, attempt,
+                )
+                try:
+                    await progress_msg.edit_text(
+                        "\u23f1 No password received within "
+                        f"{int(PASSWORD_PROMPT_TIMEOUT)}s \u2014 "
+                        "cancelling job.",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return PASSWORD_CANCEL
+
+            if kind == "guess":
+                logger.info(
+                    "Auto-guess hit for user {} job {}: using detected pw",
+                    user_id, job_id,
+                )
+                try:
+                    await progress_msg.edit_text(
+                        "\U0001f513 Password auto-detected \u2014 "
+                        "extracting\u2026",
+                        reply_markup=_cancel_job_kb(job_id),
+                    )
+                except Exception:
+                    pass
+                return value  # the password string
+
+            # kind == "user"
+            user_pw = value
+            if user_pw is None:
+                # Skip pressed.
+                try:
+                    await progress_msg.edit_text(
+                        "\u23ed Skipping encrypted entries \u2014 "
+                        "extracting the rest\u2026",
+                        reply_markup=_cancel_job_kb(job_id),
+                    )
+                except Exception:
+                    pass
+                return None
+
+            # Test the user's password immediately. We do NOT keep
+            # walking the common-password list at this point — the
+            # user's input is more reliable than guessing.
+            try:
+                await progress_msg.edit_text(
+                    "\U0001f50d Testing your password\u2026",
+                    reply_markup=_cancel_job_kb(job_id),
+                )
+            except Exception:
+                pass
+            try:
+                ok = await try_archive_password_async(archive_path, user_pw)
+            except Exception:
+                logger.exception(
+                    "Manual password test crashed on {}", archive_path,
+                )
+                ok = False
+            if ok:
+                try:
+                    await progress_msg.edit_text(
+                        "\U0001f511 Password accepted \u2014 extracting\u2026",
+                        reply_markup=_cancel_job_kb(job_id),
+                    )
+                except Exception:
+                    pass
+                return user_pw
+
+            # Wrong password — loop and re-prompt with fresh 60s timer.
+            last_failed = user_pw
+
+        # Out of retries.
         logger.info(
-            "Password prompt timed out for user {} job {}; proceeding without",
+            "Password retries exhausted for user {} job {}; cancelling.",
             user_id, job_id,
         )
-        password = None
         try:
             await progress_msg.edit_text(
-                "\u23f3 No password received \u2014 extracting only the "
-                "unencrypted files\u2026",
-                reply_markup=_cancel_job_kb(job_id),
+                f"\u274c Password failed {PASSWORD_MAX_ATTEMPTS} times "
+                "\u2014 cancelling job.",
+                reply_markup=None,
             )
         except Exception:
             pass
-    except asyncio.CancelledError:
-        password = None
+        return PASSWORD_CANCEL
     finally:
-        _pending_passwords.pop(user_id, None)
-
-    if password is None:
-        try:
-            await progress_msg.edit_text(
-                "\u23ed Skipping encrypted entries \u2014 extracting the rest\u2026",
-                reply_markup=_cancel_job_kb(job_id),
-            )
-        except Exception:
-            pass
-    else:
-        try:
-            await progress_msg.edit_text(
-                "\U0001f511 Password received \u2014 extracting\u2026",
-                reply_markup=_cancel_job_kb(job_id),
-            )
-        except Exception:
-            pass
-    return password
+        if not guess_task.done():
+            guess_task.cancel()
 
 
 async def password_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1056,6 +1261,11 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
         await asyncio.sleep(config.PROGRESS_UPDATE_INTERVAL)
         elapsed = time.monotonic() - start
         try:
+            # When the downloader is editing the live message itself
+            # every ~2 MB, the dashboard would just race with it and
+            # overwrite the user's preferred per-2MB format. Stay quiet.
+            if progress.phase == "downloading" and progress.live_download_msg:
+                continue
             if progress.phase == "downloading":
                 pct = (
                     progress.download_current / max(progress.download_total, 1) * 100

@@ -265,6 +265,11 @@ class ExtractionProgress:
     extract_start: float = 0.0      # monotonic timestamp when extraction began
     current_file: str = ""          # name of the file currently being processed
     cancelled: bool = False
+    # Set by the downloader when it is editing the user-facing status
+    # message itself (every ~2 MB). The dashboard updater checks this
+    # flag and stays silent during the downloading phase to avoid two
+    # writers fighting over the same message.
+    live_download_msg: bool = False
 
 
 @dataclass
@@ -1623,3 +1628,13 @@ async def probe_encrypted_entries_async(archive_path: str) -> List[str]:
 async def guess_archive_password_async(archive_path: str) -> Optional[str]:
     """Async wrapper around :func:`guess_archive_password`."""
     return await asyncio.to_thread(guess_archive_password, archive_path)
+
+
+async def try_archive_password_async(archive_path: str, password: str) -> bool:
+    """Async wrapper around :func:`_try_archive_password`.
+
+    Used by the chat handler when the user types a password manually —
+    we test that single candidate immediately rather than walking the
+    full common-password list, so feedback is fast.
+    """
+    return await asyncio.to_thread(_try_archive_password, archive_path, password)
