@@ -678,6 +678,7 @@ async def _process_job(
             )
             password = await _maybe_prompt_for_password(
                 context, user_id, archive_path, progress_msg, job_id,
+                progress,
             )
         else:
             archive_path = await download_file(
@@ -689,6 +690,7 @@ async def _process_job(
             )
             password = await _maybe_prompt_for_password(
                 context, user_id, archive_path, progress_msg, job_id,
+                progress,
             )
 
         # Password-cancel sentinel: caller asked us to abort the whole
@@ -934,20 +936,27 @@ def _build_password_prompt(
     last_failed: Optional[str],
     timeout_secs: int,
 ) -> str:
-    """Format the in-chat password prompt text."""
+    """Format the in-chat password prompt text.
+
+    The first-attempt prompt leads with a one-line **"file is encrypted,
+    please send the password"** call to action so it's obvious to the
+    user what to do; the auto-guess status is mentioned underneath.
+    Retries lead with the failed password instead.
+    """
     sample = ", ".join(encrypted[:3])
     if len(encrypted) > 3:
         sample += f", +{len(encrypted) - 3} more"
 
     if attempt == 1:
         header = (
-            f"\U0001f510 This archive has {len(encrypted)} "
-            f"password-protected file(s):\n<code>{sample}</code>"
+            "\U0001f510 <b>File is encrypted with a password.</b>\n"
+            "Please send the password as a chat message."
         )
         body = (
-            "I'm trying common passwords in the background. If you know "
-            "the password, <b>just type it now</b> — I'll try yours "
-            "first and skip the rest of the list."
+            f"\u2139\ufe0f {len(encrypted)} locked file(s) inside: "
+            f"<code>{sample}</code>\n"
+            "Meanwhile I'm also trying common passwords in the "
+            "background — whichever finishes first wins."
         )
     else:
         last_safe = (last_failed or "").replace("<", "&lt;").replace(">", "&gt;")
@@ -955,8 +964,9 @@ def _build_password_prompt(
             f"\u274c Password <code>{last_safe}</code> didn't work."
         )
         body = (
-            f"Try another password (attempt {attempt}/{PASSWORD_MAX_ATTEMPTS}), "
-            "or tap Skip to extract only the unencrypted files."
+            f"Send another password "
+            f"(attempt {attempt}/{PASSWORD_MAX_ATTEMPTS}), or tap Skip "
+            "to extract only the unencrypted files."
         )
 
     return (
@@ -1051,6 +1061,7 @@ async def _maybe_prompt_for_password(
     archive_path: str,
     progress_msg,
     job_id: int,
+    progress: Optional[ExtractionProgress] = None,
 ):
     """Probe *archive_path* for encrypted entries. If any exist:
 
@@ -1071,13 +1082,28 @@ async def _maybe_prompt_for_password(
                                  (user pressed Skip).
     - ``PASSWORD_CANCEL``      — timed out; caller should abort the job.
     """
+    # Flip into the awaiting_password phase BEFORE we do anything else
+    # so the dashboard updater stops rewriting the chat message every
+    # 2 s — otherwise it keeps repainting the "Downloading 100% complete"
+    # template on top of our password prompt and the user never gets a
+    # chance to read it. We restore the previous phase in `finally` if
+    # the archive turns out not to be encrypted.
+    prev_phase: Optional[str] = None
+    if progress is not None:
+        prev_phase = progress.phase
+        progress.phase = "awaiting_password"
+
     try:
         encrypted = await probe_encrypted_entries_async(archive_path)
     except Exception:
         logger.exception("Password probe failed on {}", archive_path)
+        if progress is not None and prev_phase is not None:
+            progress.phase = prev_phase
         return None
 
     if not encrypted:
+        if progress is not None and prev_phase is not None:
+            progress.phase = prev_phase
         return None
 
     # Background auto-guess. Runs concurrently with the user prompt;
@@ -1203,6 +1229,13 @@ async def _maybe_prompt_for_password(
     finally:
         if not guess_task.done():
             guess_task.cancel()
+        # Hand control back to the dashboard updater. We restore the
+        # phase the caller had us in (typically "downloading", since
+        # the prompt fires right after the download finishes); the
+        # extractor will overwrite this to "extracting" the moment it
+        # starts.
+        if progress is not None and prev_phase is not None:
+            progress.phase = prev_phase
 
 
 async def password_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1261,6 +1294,13 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
         await asyncio.sleep(config.PROGRESS_UPDATE_INTERVAL)
         elapsed = time.monotonic() - start
         try:
+            # While the extract handler is showing the password prompt
+            # (and waiting up to 60 s for the user to reply), the
+            # dashboard would otherwise repaint over the prompt every
+            # 2 s and the user would never see what they're meant to
+            # type. Stay completely silent during this phase.
+            if progress.phase == "awaiting_password":
+                continue
             # When the downloader is editing the live message itself
             # every ~2 MB, the dashboard would just race with it and
             # overwrite the user's preferred per-2MB format. Stay quiet.
