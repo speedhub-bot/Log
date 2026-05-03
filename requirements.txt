@@ -1,5 +1,11 @@
 python-telegram-bot[job-queue]>=20.0
-pyrogram>=2.0.0
+# Pyrofork is a drop-in replacement for pyrogram with several download
+# fixes (bigger chunk sizes, unstuck FloodWait, faster file references)
+# and ships under the same `pyrogram` import name. tgcrypto is the C
+# implementation of Telegram's MTProto crypto — without it downloads
+# fall back to a pure-Python AES-IGE implementation that is ~5-10x
+# slower.
+pyrofork>=2.3.45
 tgcrypto>=1.2.0
 aiosqlite>=0.19.0
 python-dotenv>=1.0.0
