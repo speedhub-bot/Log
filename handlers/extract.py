@@ -930,11 +930,18 @@ def _password_prompt_kb(job_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def _escape_pw(value: str) -> str:
+    """HTML-escape a password fragment for safe rendering inside <code>."""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _build_password_prompt(
     encrypted: List[str],
     attempt: int,
     last_failed: Optional[str],
     timeout_secs: int,
+    current_guess: str = "",
+    tried_guesses: Optional[List[str]] = None,
 ) -> str:
     """Format the in-chat password prompt text.
 
@@ -942,6 +949,11 @@ def _build_password_prompt(
     please send the password"** call to action so it's obvious to the
     user what to do; the auto-guess status is mentioned underneath.
     Retries lead with the failed password instead.
+
+    When *current_guess* / *tried_guesses* are populated, the prompt
+    also lists the password the bot is currently testing in the
+    background plus the last few candidates it has already ruled out,
+    so the user can see exactly what's been tried.
     """
     sample = ", ".join(encrypted[:3])
     if len(encrypted) > 3:
@@ -959,7 +971,7 @@ def _build_password_prompt(
             "background — whichever finishes first wins."
         )
     else:
-        last_safe = (last_failed or "").replace("<", "&lt;").replace(">", "&gt;")
+        last_safe = _escape_pw(last_failed or "")
         header = (
             f"\u274c Password <code>{last_safe}</code> didn't work."
         )
@@ -969,10 +981,24 @@ def _build_password_prompt(
             "to extract only the unencrypted files."
         )
 
-    return (
-        f"{header}\n\n{body}\n\n"
-        f"\u23f1 Auto-cancel in <b>{timeout_secs} s</b> if no reply."
-    )
+    parts = [header, "", body]
+    # Live auto-guess feedback so the user can see which passwords have
+    # already been ruled out without re-typing them.
+    tried = [t for t in (tried_guesses or []) if t]
+    if current_guess or tried:
+        parts.append("")
+        if current_guess:
+            parts.append(
+                "\U0001f50d Currently testing: "
+                f"<code>{_escape_pw(current_guess)}</code>"
+            )
+        if tried:
+            shown = tried[-6:]
+            joined = ", ".join(f"<code>{_escape_pw(t)}</code>" for t in shown)
+            parts.append(f"Already tried: {joined}")
+    parts.append("")
+    parts.append(f"\u23f1 Auto-cancel in <b>{timeout_secs} s</b> if no reply.")
+    return "\n".join(parts)
 
 
 async def _wait_for_password_or_guess(
@@ -1106,21 +1132,41 @@ async def _maybe_prompt_for_password(
             progress.phase = prev_phase
         return None
 
+    # Reset live-attempt fields before kicking off the auto-guess so
+    # the prompt starts empty and only fills with what *this* job has
+    # attempted.
+    if progress is not None:
+        progress.current_password_attempt = ""
+        progress.password_attempts.clear()
+
     # Background auto-guess. Runs concurrently with the user prompt;
     # we cancel it as soon as we have a winning password from either
-    # source.
+    # source. Hands ``progress`` to the guesser so it can stream the
+    # password it's currently testing back to the chat prompt.
     guess_task: "asyncio.Task[Optional[str]]" = asyncio.create_task(
-        guess_archive_password_async(archive_path),
+        guess_archive_password_async(archive_path, progress),
         name=f"guess_pw_{job_id}",
     )
+
+    def _snapshot_attempts() -> tuple[str, List[str]]:
+        if progress is None:
+            return "", []
+        return (
+            progress.current_password_attempt,
+            list(progress.password_attempts),
+        )
 
     try:
         last_failed: Optional[str] = None
         for attempt in range(1, PASSWORD_MAX_ATTEMPTS + 1):
             timeout_secs = int(PASSWORD_PROMPT_TIMEOUT)
+            current_guess, tried_guesses = _snapshot_attempts()
             prompt_text = _build_password_prompt(
                 encrypted, attempt, last_failed, timeout_secs,
+                current_guess=current_guess,
+                tried_guesses=tried_guesses,
             )
+            last_prompt_text = prompt_text
             try:
                 await progress_msg.edit_text(
                     prompt_text,
@@ -1132,9 +1178,45 @@ async def _maybe_prompt_for_password(
                     "Failed to edit progress msg for password prompt",
                 )
 
-            kind, value = await _wait_for_password_or_guess(
-                user_id, guess_task, PASSWORD_PROMPT_TIMEOUT,
+            # Race the user/guess wait against a periodic prompt
+            # refresh so the "currently testing"/"already tried" lines
+            # update live without spamming Telegram with edits.
+            wait_task = asyncio.create_task(
+                _wait_for_password_or_guess(
+                    user_id, guess_task, PASSWORD_PROMPT_TIMEOUT,
+                ),
+                name=f"pw_wait_{job_id}_{attempt}",
             )
+            try:
+                while True:
+                    refresh_done, _pending = await asyncio.wait(
+                        {wait_task}, timeout=2.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if wait_task in refresh_done:
+                        break
+                    new_guess, new_tried = _snapshot_attempts()
+                    new_prompt = _build_password_prompt(
+                        encrypted, attempt, last_failed, timeout_secs,
+                        current_guess=new_guess,
+                        tried_guesses=new_tried,
+                    )
+                    if new_prompt != last_prompt_text:
+                        last_prompt_text = new_prompt
+                        try:
+                            await progress_msg.edit_text(
+                                new_prompt,
+                                parse_mode="HTML",
+                                reply_markup=_password_prompt_kb(job_id),
+                            )
+                        except Exception:
+                            # Telegram rejects identical-text edits and
+                            # other transient errors are harmless here.
+                            pass
+                kind, value = wait_task.result()
+            except asyncio.CancelledError:
+                wait_task.cancel()
+                raise
 
             if kind == "timeout":
                 logger.info(

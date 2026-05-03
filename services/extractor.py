@@ -270,6 +270,12 @@ class ExtractionProgress:
     # flag and stays silent during the downloading phase to avoid two
     # writers fighting over the same message.
     live_download_msg: bool = False
+    # Live password-guess feedback. ``current_password_attempt`` is the
+    # candidate currently being tested by the auto-guesser; the prompt
+    # renders it so the user can see what the bot has already tried.
+    # ``password_attempts`` keeps the most recent failed candidates.
+    current_password_attempt: str = ""
+    password_attempts: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -463,14 +469,24 @@ def _password_candidates(archive_path: str) -> List[str]:
     return out
 
 
+# Max wall-clock time we let a single password test run. Big archives
+# (hundreds of MB) can take well over a minute on cheap CPU before 7z /
+# unrar finishes integrity-testing every encrypted entry, so 30 s used
+# to false-fail correct passwords on large stealer dumps.
+PASSWORD_TEST_TIMEOUT = 300
+
+
 def _try_archive_password(archive_path: str, password: str) -> bool:
     """Return True if *password* successfully decrypts *archive_path*.
 
     Uses ``unrar t -p<pwd>`` for RAR (exit 0 = ok, 11 = wrong pwd) and
-    ``7z t -p<pwd>`` for the rest (exit 0 = ok, 2 = wrong pwd).
+    ``7z t -p<pwd>`` for the rest. ``7z`` exit 1 is "warning" (e.g.
+    extra-data warnings on otherwise-valid archives) and we treat it as
+    a pass; only exit 2 / non-zero with stderr-flagged "Wrong password"
+    is treated as a hard fail.
 
-    Pipes ``-y`` / stdin=DEVNULL so the tool never hangs prompting.
-    Gives each attempt 30s before giving up.
+    Pipes ``-y`` / stdin=DEVNULL so the tool never hangs prompting and
+    allows ``PASSWORD_TEST_TIMEOUT`` seconds before giving up.
     """
     import shutil as _shutil
 
@@ -480,39 +496,88 @@ def _try_archive_password(archive_path: str, password: str) -> bool:
         unrar = _shutil.which("unrar")
         if unrar:
             try:
-                rc = subprocess.run(
+                proc = subprocess.run(
                     [unrar, "t", f"-p{password}", "-y", "-inul", archive_path],
-                    capture_output=True, timeout=30,
+                    capture_output=True, timeout=PASSWORD_TEST_TIMEOUT,
                     stdin=subprocess.DEVNULL,
                     start_new_session=True,
-                ).returncode
-                return rc == 0
+                )
+                # unrar: 0 = success, 11 = wrong password, anything else
+                # is a tool-side issue (corrupt archive, missing file,
+                # etc.) — we surface those in the log so debugging a
+                # "wrong password" report is straightforward.
+                if proc.returncode == 0:
+                    return True
+                if proc.returncode != 11:
+                    err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+                    out = (proc.stdout or b"").decode("utf-8", "replace").strip()
+                    logger.debug(
+                        "unrar test rc={} stderr={!r} stdout={!r}",
+                        proc.returncode, err[:200], out[:200],
+                    )
+                return False
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "unrar password test timed out after {}s on {}",
+                    PASSWORD_TEST_TIMEOUT, os.path.basename(archive_path),
+                )
+                return False
             except Exception:
+                logger.exception("unrar password test crashed")
                 return False
 
     sz = _shutil.which("7z")
     if sz:
         try:
-            rc = subprocess.run(
+            proc = subprocess.run(
                 [sz, "t", f"-p{password}", archive_path],
-                capture_output=True, timeout=30,
+                capture_output=True, timeout=PASSWORD_TEST_TIMEOUT,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
-            ).returncode
-            return rc == 0
+            )
+            # 7z: 0 = ok, 1 = warning (still OK), 2 = fatal (incl. wrong
+            # password). We accept 0 + 1 as success and look at stderr
+            # for the "Wrong password" / "Data Error" markers when in
+            # doubt.
+            if proc.returncode in (0, 1):
+                return True
+            err = (proc.stderr or b"").decode("utf-8", "replace")
+            out = (proc.stdout or b"").decode("utf-8", "replace")
+            if "Wrong password" in out or "Wrong password" in err:
+                return False
+            logger.debug(
+                "7z test rc={} stderr={!r} stdout={!r}",
+                proc.returncode, err.strip()[:200], out.strip()[:200],
+            )
+            return False
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "7z password test timed out after {}s on {}",
+                PASSWORD_TEST_TIMEOUT, os.path.basename(archive_path),
+            )
+            return False
         except Exception:
+            logger.exception("7z password test crashed")
             return False
 
     return False
 
 
-def guess_archive_password(archive_path: str) -> Optional[str]:
+def guess_archive_password(
+    archive_path: str,
+    progress: Optional["ExtractionProgress"] = None,
+) -> Optional[str]:
     """Try the password candidate list against *archive_path*.
 
     Returns the first password that successfully tests, or ``None`` if
     none of the candidates worked. Runs sequentially — candidate list
     is short enough (~30 entries) that parallelism isn't worth the
     extra fork overhead.
+
+    When *progress* is supplied we publish the password currently being
+    tested via ``progress.current_password_attempt`` and append every
+    attempted candidate (capped at the most recent 10) to
+    ``progress.password_attempts`` so the prompt can render a live list.
     """
     candidates = _password_candidates(archive_path)
     logger.info(
@@ -520,12 +585,29 @@ def guess_archive_password(archive_path: str) -> Optional[str]:
         len(candidates), os.path.basename(archive_path),
     )
     for pwd in candidates:
+        if progress is not None:
+            if progress.cancelled:
+                progress.current_password_attempt = ""
+                return None
+            progress.current_password_attempt = pwd
+        logger.debug("password test: trying {!r}", pwd)
         if _try_archive_password(archive_path, pwd):
+            if progress is not None:
+                progress.current_password_attempt = ""
             logger.info(
                 "Password auto-guess hit for {}: {!r}",
                 os.path.basename(archive_path), pwd,
             )
             return pwd
+        if progress is not None:
+            attempts = progress.password_attempts
+            attempts.append(pwd)
+            # Keep the visible history short — Telegram's max message
+            # length is small relative to a 30-entry candidate list.
+            if len(attempts) > 10:
+                del attempts[: len(attempts) - 10]
+    if progress is not None:
+        progress.current_password_attempt = ""
     logger.info(
         "Password auto-guess exhausted for {} ({} candidates tried)",
         os.path.basename(archive_path), len(candidates),
@@ -1625,9 +1707,14 @@ async def probe_encrypted_entries_async(archive_path: str) -> List[str]:
     return await asyncio.to_thread(_probe_encrypted_entries, archive_path)
 
 
-async def guess_archive_password_async(archive_path: str) -> Optional[str]:
+async def guess_archive_password_async(
+    archive_path: str,
+    progress: Optional["ExtractionProgress"] = None,
+) -> Optional[str]:
     """Async wrapper around :func:`guess_archive_password`."""
-    return await asyncio.to_thread(guess_archive_password, archive_path)
+    return await asyncio.to_thread(
+        guess_archive_password, archive_path, progress,
+    )
 
 
 async def try_archive_password_async(archive_path: str, password: str) -> bool:
