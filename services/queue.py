@@ -50,6 +50,7 @@ class QueueItem:
     coro_factory: Callable[[], Awaitable[Any]] = field(compare=False, repr=False)
     enqueued_at: float = field(default_factory=time.monotonic, compare=False)
     cancelled: bool = field(default=False, compare=False)
+    task: Optional[asyncio.Task[Any]] = field(default=None, compare=False, repr=False)
 
 
 class JobQueue:
@@ -105,6 +106,11 @@ class JobQueue:
                 self._pending = [i for i in self._pending if not i.cancelled]
                 logger.info("Job {} cancelled in queue", job_id)
                 return True
+        item = self._active.get(job_id)
+        if item is not None and not item.cancelled:
+            item.cancelled = True
+            logger.info("Job {} cancellation requested while active", job_id)
+            return True
         return False
 
     @property
@@ -135,7 +141,10 @@ class JobQueue:
             self._active[item.job_id] = item
             try:
                 logger.info("Job {} started", item.job_id)
-                await item.coro_factory()
+                item.task = asyncio.create_task(item.coro_factory())
+                await item.task
+            except asyncio.CancelledError:
+                logger.info("Job {} cancelled", item.job_id)
             except Exception:
                 logger.exception("Job {} raised", item.job_id)
             finally:

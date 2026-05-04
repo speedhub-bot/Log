@@ -697,11 +697,12 @@ async def _process_job(
         # job because the user didn't reply to the password prompt
         # within the timeout (or burned all retries).
         if password is PASSWORD_CANCEL:
-            updater_task.cancel()
-            try:
-                await updater_task
-            except asyncio.CancelledError:
-                pass
+            if not updater_task.done():
+                updater_task.cancel()
+                try:
+                    await updater_task
+                except asyncio.CancelledError:
+                    pass
             duration = time.monotonic() - start_ts
             await db.update_job(
                 job_id,
@@ -718,11 +719,12 @@ async def _process_job(
             archive_path, domains, progress, password=password,
         )
 
-        updater_task.cancel()
-        try:
-            await updater_task
-        except asyncio.CancelledError:
-            pass
+        if not updater_task.done():
+            updater_task.cancel()
+            try:
+                await updater_task
+            except asyncio.CancelledError:
+                pass
 
         # Hard failure (no partial output to ship).
         if not result.success and not result.output_files:
@@ -806,31 +808,39 @@ async def _process_job(
                             cached_entry.file_size if cached_entry
                             else os.path.getsize(archive_path)
                         )
-                        _register_rescan(
-                            user_id,
-                            archive_path,
-                            cached_name,
-                            cached_size,
-                            float(config.RESCAN_WINDOW_SECONDS),
-                            password=cached_pw,
-                        )
-                        rescan_armed = True
+                        if cached_size <= config.RESCAN_MAX_ARCHIVE_BYTES:
+                            _register_rescan(
+                                user_id,
+                                archive_path,
+                                cached_name,
+                                cached_size,
+                                float(config.RESCAN_WINDOW_SECONDS),
+                                password=cached_pw,
+                            )
+                            rescan_armed = True
                 elif os.path.exists(archive_path):
                     target_dir = _rescan_dir()
                     target_name = (
                         f"{user_id}_{job_id}_{os.path.basename(archive_path)}"
                     )
-                    target_path = os.path.join(target_dir, target_name)
-                    shutil.move(archive_path, target_path)
-                    _register_rescan(
-                        user_id,
-                        target_path,
-                        os.path.basename(archive_path),
-                        os.path.getsize(target_path),
-                        float(config.RESCAN_WINDOW_SECONDS),
-                        password=password,
-                    )
-                    rescan_armed = True
+                    archive_size = os.path.getsize(archive_path)
+                    if archive_size <= config.RESCAN_MAX_ARCHIVE_BYTES:
+                        target_path = os.path.join(target_dir, target_name)
+                        shutil.move(archive_path, target_path)
+                        _register_rescan(
+                            user_id,
+                            target_path,
+                            os.path.basename(archive_path),
+                            os.path.getsize(target_path),
+                            float(config.RESCAN_WINDOW_SECONDS),
+                            password=password,
+                        )
+                        rescan_armed = True
+                    else:
+                        logger.info(
+                            "Skipping rescan cache for {} ({} bytes > {} bytes)",
+                            archive_path, archive_size, config.RESCAN_MAX_ARCHIVE_BYTES,
+                        )
         except Exception:
             logger.exception(
                 "Failed to register rescan window for user {}", user_id,
@@ -1525,16 +1535,16 @@ async def cancel_job_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except (ValueError, IndexError):
         return
 
-    # Cancel in queue
-    if _job_queue and _job_queue.cancel(job_id):
-        await db.update_job(job_id, status="cancelled", completed_at=db._now())
-        await query.edit_message_text("\u274c Job cancelled (was queued).")
-        return
-
-    # Cancel running job
     prog = _active_progress.get(job_id)
     if prog:
         prog.cancelled = True
+
+    if _job_queue and _job_queue.cancel(job_id):
+        await db.update_job(job_id, status="cancelled", completed_at=db._now())
+        await query.edit_message_text("\u274c Cancelling job...")
+        return
+
+    if prog:
         await db.update_job(job_id, status="cancelled", completed_at=db._now())
         await query.edit_message_text("\u274c Cancelling job...")
         return

@@ -16,6 +16,10 @@ def _int(key: str, default: int) -> int:
     return int(os.getenv(key, str(default)))
 
 
+def _float(key: str, default: float) -> float:
+    return float(os.getenv(key, str(default)))
+
+
 def _str(key: str, default: str) -> str:
     return os.getenv(key, default)
 
@@ -34,11 +38,13 @@ ADMIN_ID: int = _int("ADMIN_ID", 5944410248)
 # Hard cap on concurrent extraction jobs across the whole bot. The
 # queue uses a three-tier priority system (admin > VIP > free) so heavy
 # load doesn't starve admins/VIPs.
-MAX_CONCURRENT_JOBS: int = _int("MAX_CONCURRENT_JOBS", 15)
+MAX_CONCURRENT_JOBS: int = _int("MAX_CONCURRENT_JOBS", 2)
 FREE_DAILY_LIMIT_GB: int = _int("FREE_DAILY_LIMIT_GB", 2)
 FREE_DAILY_LIMIT_BYTES: int = FREE_DAILY_LIMIT_GB * 1024 ** 3
 FREE_MAX_FILE_BYTES: int = 2 * 1024 ** 3          # 2 GB
 VIP_MAX_FILE_BYTES: int = 10 * 1024 ** 3           # 10 GB
+MIN_FREE_DISK_BYTES: int = _int("MIN_FREE_DISK_GB", 1) * 1024 ** 3
+EXTRACTION_DISK_MULTIPLIER: float = _float("EXTRACTION_DISK_MULTIPLIER", 2.0)
 
 # ── Paths ───────────────────────────────────────────────────
 DATABASE_PATH: str = _str("DATABASE_PATH", "bot.db")
@@ -54,6 +60,7 @@ MAX_DOMAINS_PER_EXTRACT: int = _int("MAX_DOMAINS_PER_EXTRACT", 10)
 # same archive without re-uploading. After the window expires the
 # archive is auto-deleted. Default: 2 minutes.
 RESCAN_WINDOW_SECONDS: int = _int("RESCAN_WINDOW_SECONDS", 120)
+RESCAN_MAX_ARCHIVE_BYTES: int = _int("RESCAN_MAX_ARCHIVE_GB", 2) * 1024 ** 3
 
 # ── Rate-limits / anti-abuse ────────────────────────────────
 MAX_EXTRACTIONS_PER_HOUR: int = 3

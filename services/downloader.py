@@ -29,6 +29,8 @@ from telegram import Document, Message
 import config
 from services.extractor import ExtractionProgress
 
+RESUME_RETRY_DELAY_SECONDS = 2.0
+
 # Lazy-initialised Pyrogram client
 _pyro_client: Client | None = None
 _pyro_started: bool = False
@@ -52,12 +54,12 @@ LIVE_MSG_EDIT_INTERVAL = 1.5
 # this knob only controls how many *separate* downloads can run
 # concurrently when the legacy fallback path is used.
 MAX_CONCURRENT_TRANSMISSIONS = int(
-    os.getenv("PYROGRAM_MAX_TRANSMISSIONS", "50")
+    os.getenv("PYROGRAM_MAX_TRANSMISSIONS", "16")
 )
 
 # Worker thread pool inside Pyrogram (chunk decryption + write back).
 # 32 keeps tgcrypto saturated on the multi-session parallel path.
-PYROGRAM_WORKERS = int(os.getenv("PYROGRAM_WORKERS", "32"))
+PYROGRAM_WORKERS = int(os.getenv("PYROGRAM_WORKERS", "16"))
 
 # ── Parallel chunk download tuning ────────────────────────────────
 #
@@ -331,6 +333,12 @@ async def _parallel_download(
     if cdn_redirected:
         raise NotImplementedError("CDN redirect")
 
+    if file_size and os.path.getsize(out_path) != file_size:
+        raise RuntimeError(
+            f"Incomplete download: got {os.path.getsize(out_path):,} "
+            f"of {file_size:,} bytes"
+        )
+
     return out_path
 
 
@@ -372,6 +380,19 @@ async def _edit_live_progress(
         pass
 
 
+def ensure_enough_disk_space(dest_path: str, required_bytes: int) -> None:
+    if required_bytes <= 0:
+        return
+    usage = os.statvfs(dest_path)
+    free_bytes = usage.f_bavail * usage.f_frsize
+    if free_bytes < required_bytes:
+        raise RuntimeError(
+            "Not enough disk space for this archive. "
+            f"Need about {required_bytes / (1024 ** 3):.1f} GB free; "
+            f"only {free_bytes / (1024 ** 3):.1f} GB is available."
+        )
+
+
 async def download_file(
     message: Message,
     dest_path: str,
@@ -409,6 +430,13 @@ async def download_file(
     progress.download_start = time.monotonic()
     progress.live_download_msg = status_msg is not None
 
+    os.makedirs(dest_path, exist_ok=True)
+    required_bytes = int(
+        file_size * config.EXTRACTION_DISK_MULTIPLIER
+        + config.MIN_FREE_DISK_BYTES
+    )
+    ensure_enough_disk_space(dest_path, required_bytes)
+
     logger.info(
         "Downloading {} ({:.1f} MB) via Pyrogram MTProto "
         "(parallel_sessions={}, per_session={}, sleep_threshold={}s)",
@@ -436,6 +464,12 @@ async def download_file(
     attempt = 0
     while True:
         attempt += 1
+        if attempt > 1 and os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            progress.download_current = 0
         start_ts = time.monotonic()
         last_log = start_ts
         last_bytes = 0
@@ -517,7 +551,7 @@ async def download_file(
                     edit_inflight = False
 
         def _cancel_cb() -> bool:
-            return bool(getattr(progress, "cancelled", False))
+            return bool(progress.cancelled)
 
         try:
             try:
@@ -558,6 +592,13 @@ async def download_file(
                     attempt, max_retries, wait,
                 )
                 await asyncio.sleep(float(wait))
+                continue
+            if attempt < max_retries and not progress.cancelled:
+                logger.warning(
+                    "Download attempt {}/{} failed ({}); retrying from byte 0",
+                    attempt, max_retries, exc,
+                )
+                await asyncio.sleep(RESUME_RETRY_DELAY_SECONDS)
                 continue
             raise
 
@@ -659,6 +700,11 @@ async def download_from_url(
                 )
             total = int(resp.headers.get("Content-Length", 0) or 0)
             progress.download_total = total
+            required_bytes = int(
+                total * config.EXTRACTION_DISK_MULTIPLIER
+                + config.MIN_FREE_DISK_BYTES
+            )
+            ensure_enough_disk_space(dest_path, required_bytes)
             cd = resp.headers.get("Content-Disposition", "") or ""
             file_name = file_name_hint or _filename_from_headers(url, cd)
             if not any(file_name.lower().endswith(ext) for ext in (
