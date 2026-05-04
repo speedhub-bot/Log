@@ -8,7 +8,7 @@ Production-grade Telegram bot for extracting cookies from Netscape-format archiv
 - **Multi-domain Extraction** — Submit several domains at once (e.g. `spotify.com, netflix.com, crunchyroll.com`) and the bot scans the archive once, producing a separate result file per domain. Configurable via `MAX_DOMAINS_PER_EXTRACT` (default `10`).
 - **Live Dashboard** — Per-phase progress: download speed/ETA, extraction file counter (`current/total`), scanning files-per-second, **live cookies-found counter**, and the file currently being processed. Refreshes every 2 s.
 - **Cancel-with-partial-results** — Hit cancel on a running job and the bot still ships whatever cookies it has already found, captioned as partial results.
-- **Large File Support** — All files downloaded via Pyrogram MTProto with **16 parallel chunk transfers** (up to 10 GB for VIP). Configurable via `PYROGRAM_MAX_TRANSMISSIONS`.
+- **Large File Support** — All files downloaded via Pyrogram MTProto with **16 parallel chunk transfers** (up to 10 GB for VIP), disk-space preflight checks, resumable job cancellation, and streaming extraction/scanning paths to avoid RAM spikes. Configurable via `PYROGRAM_MAX_TRANSMISSIONS`.
 - **Queue System** — Async priority queue with VIP skip-ahead and configurable concurrency
 - **Quota System** — Per-user daily byte limits with midnight UTC reset
 - **VIP Membership** — Unlimited quota, priority queue, larger file limits
@@ -65,6 +65,12 @@ Required variables:
 - `BOT_TOKEN` — From [@BotFather](https://t.me/BotFather)
 - `API_ID` / `API_HASH` — From [my.telegram.org](https://my.telegram.org)
 - `ADMIN_ID` — Your Telegram numeric user ID
+
+Large-file tuning:
+- `MAX_CONCURRENT_JOBS` defaults to `2` so multiple 3–10 GB jobs do not exhaust disk/RAM.
+- `MIN_FREE_DISK_GB` keeps emergency free space available before accepting a large job.
+- `EXTRACTION_DISK_MULTIPLIER` estimates download + extraction temp-space needs.
+- `RESCAN_MAX_ARCHIVE_GB` limits the quick-rescan cache so huge archives are deleted after results are sent.
 
 No session string needed — Pyrogram uses the bot token to download files of any size via MTProto.
 

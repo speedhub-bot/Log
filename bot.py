@@ -15,6 +15,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
@@ -78,11 +79,14 @@ async def _cleanup_temp() -> None:
     temp = str(config.TEMP_DIR)
     if not os.path.isdir(temp):
         return
+    rescan_root = Path(temp) / "rescan"
     now = time.time()
     cutoff = config.TEMP_FILE_MAX_AGE_HOURS * 3600
     cleaned = 0
     for entry in os.scandir(temp):
         try:
+            if Path(entry.path) == rescan_root:
+                continue
             age = now - entry.stat().st_mtime
             if age > cutoff:
                 if entry.is_dir():
@@ -253,7 +257,16 @@ def main() -> None:
     def _atexit_cleanup() -> None:
         temp = str(config.TEMP_DIR)
         if os.path.isdir(temp):
-            shutil.rmtree(temp, ignore_errors=True)
+            for entry in os.scandir(temp):
+                if entry.name == "rescan":
+                    continue
+                try:
+                    if entry.is_dir():
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                    else:
+                        os.remove(entry.path)
+                except OSError:
+                    pass
 
     atexit.register(_atexit_cleanup)
 

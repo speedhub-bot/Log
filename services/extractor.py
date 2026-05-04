@@ -12,6 +12,7 @@ import asyncio
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tarfile
 import tempfile
@@ -25,6 +26,10 @@ from typing import Callable, Dict, Iterable, List, Optional, Union
 from loguru import logger
 
 import config
+
+MAX_TEXT_SCAN_BYTES = 64 * 1024 * 1024
+PROCESS_TAIL_BYTES = 8192
+ARCHIVE_PROCESS_IDLE_SECONDS = 900.0
 
 
 # ════════════════════════════════════════════════════════════
@@ -101,16 +106,11 @@ class SmartCookieExtractor:
         if not fp.exists():
             raise FileNotFoundError(f"File not found: {fp}")
         with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-            return self.extract_from_text(f.read())
+            return self.extract_from_lines(f)
 
-    def extract_from_text(self, text: str) -> List[Dict[str, str]]:
-        """Extract cookies from a raw Netscape-format cookies string.
-
-        Lets streaming code paths (e.g. in-memory decompressed zip
-        entries) reuse the same parser without writing to disk.
-        """
+    def extract_from_lines(self, lines: Iterable[str]) -> List[Dict[str, str]]:
         results: List[Dict[str, str]] = []
-        for line in text.splitlines():
+        for line in lines:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -122,6 +122,14 @@ class SmartCookieExtractor:
                 cookie["target_domain"] = target
                 results.append(cookie)
         return results
+
+    def extract_from_text(self, text: str) -> List[Dict[str, str]]:
+        """Extract cookies from a raw Netscape-format cookies string.
+
+        Lets streaming code paths (e.g. in-memory decompressed zip
+        entries) reuse the same parser without writing to disk.
+        """
+        return self.extract_from_lines(text.splitlines())
 
     def parse_cookie_line(self, line: str) -> Optional[Dict[str, str]]:
         """
@@ -292,6 +300,48 @@ class ExtractionResult:
     # was configured for one or more domains; keys are the cleaned target
     # domain strings.
     per_domain_counts: Dict[str, int] = field(default_factory=dict)
+
+
+def _terminate_process(proc: subprocess.Popen) -> None:
+    try:
+        if proc.poll() is not None:
+            return
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def _kill_process(proc: subprocess.Popen) -> None:
+    try:
+        if proc.poll() is not None:
+            return
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _tail_append(lines: List[str], line: str, limit: int = PROCESS_TAIL_BYTES) -> None:
+    lines.append(line)
+    total = 0
+    keep: List[str] = []
+    for item in reversed(lines):
+        total += len(item.encode("utf-8", "ignore"))
+        if total > limit and keep:
+            break
+        keep.append(item)
+    keep.reverse()
+    if len(keep) != len(lines):
+        lines[:] = keep
 
 
 def _safe_zip_extract(
@@ -808,7 +858,7 @@ def _extract_with_7z(
     # advance progress for this many seconds, assume the underlying tool
     # is wedged and kill it. Picked generously so big-file decompression
     # still finishes naturally.
-    WATCHDOG_IDLE_SECONDS = 90.0
+    WATCHDOG_IDLE_SECONDS = ARCHIVE_PROCESS_IDLE_SECONDS
     last_progress_count = 0
     last_progress_time = time.monotonic()
     stop_watchdog = threading.Event()
@@ -833,10 +883,7 @@ def _extract_with_7z(
                     "terminating.",
                     int(WATCHDOG_IDLE_SECONDS), current,
                 )
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                _kill_process(proc)
                 return
 
     watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
@@ -846,7 +893,7 @@ def _extract_with_7z(
         assert proc.stderr is not None
         with _DirCountPoller(dest, progress):
             for line in proc.stderr:
-                stderr_chunks.append(line)
+                _tail_append(stderr_chunks, line)
                 # 7z streams progress with embedded backspaces and CRs to
                 # repaint a TTY counter; strip those before parsing so the
                 # regex can find the "- relative/path" suffix.
@@ -866,11 +913,11 @@ def _extract_with_7z(
                         if file_lines_seen > progress.extract_current:
                             progress.extract_current = file_lines_seen
                 if progress is not None and progress.cancelled:
-                    proc.terminate()
+                    _terminate_process(proc)
                     break
             proc.wait(timeout=60)
     except Exception:
-        proc.kill()
+        _kill_process(proc)
         raise
     finally:
         stop_watchdog.set()
@@ -972,7 +1019,7 @@ def _extract_with_unrar(
         start_new_session=True,
     )
     output_chunks: List[str] = []
-    WATCHDOG_IDLE_SECONDS = 90.0
+    WATCHDOG_IDLE_SECONDS = ARCHIVE_PROCESS_IDLE_SECONDS
     last_progress_count = 0
     last_progress_time = time.monotonic()
     stop_watchdog = threading.Event()
@@ -993,10 +1040,7 @@ def _extract_with_unrar(
                     "terminating.",
                     int(WATCHDOG_IDLE_SECONDS), current,
                 )
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                _kill_process(proc)
                 return
 
     watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
@@ -1006,7 +1050,7 @@ def _extract_with_unrar(
         assert proc.stdout is not None
         with _DirCountPoller(dest, progress):
             for line in proc.stdout:
-                output_chunks.append(line)
+                _tail_append(output_chunks, line)
                 cleaned = line.strip()
                 if not cleaned:
                     continue
@@ -1016,11 +1060,11 @@ def _extract_with_unrar(
                     name = m.group(1).strip()
                     progress.current_file = os.path.basename(name) or name
                 if progress is not None and progress.cancelled:
-                    proc.terminate()
+                    _terminate_process(proc)
                     break
             proc.wait(timeout=60)
     except Exception:
-        proc.kill()
+        _kill_process(proc)
         raise
     finally:
         stop_watchdog.set()
@@ -1415,30 +1459,22 @@ def _run_extraction_zip_stream(
                 )
                 progress.extract_current += 1
 
-                # Hard cap per-entry size so a corrupt zip bomb can't
-                # OOM us. Cookie txts are small — 64 MiB is generous.
-                if member.file_size and member.file_size > 64 * 1024 * 1024:
+                if member.file_size and member.file_size > MAX_TEXT_SCAN_BYTES:
                     progress.files_scanned += 1
                     continue
 
                 try:
                     with zf.open(member, "r") as fh:
-                        raw = fh.read()
+                        cookies = cookie_parser.extract_from_lines(
+                            line.decode("utf-8", errors="ignore")
+                            for line in fh
+                        )
                 except (RuntimeError, zipfile.BadZipFile, OSError):
                     # RuntimeError from zipfile means encrypted entry —
                     # we already probed and ruled that out, but just in
                     # case skip silently instead of aborting the job.
                     progress.files_scanned += 1
                     continue
-
-                try:
-                    text = raw.decode("utf-8", errors="ignore")
-                except Exception:
-                    progress.files_scanned += 1
-                    continue
-
-                try:
-                    cookies = cookie_parser.extract_from_text(text)
                 except Exception:
                     cookies = []
 
@@ -1594,6 +1630,13 @@ def _run_extraction(
             if progress.cancelled:
                 break
             progress.current_file = os.path.basename(fpath)
+            try:
+                if os.path.getsize(fpath) > MAX_TEXT_SCAN_BYTES:
+                    progress.files_scanned += 1
+                    continue
+            except OSError:
+                progress.files_scanned += 1
+                continue
             try:
                 cookies = extractor.extract_from_file(fpath)
             except Exception:
