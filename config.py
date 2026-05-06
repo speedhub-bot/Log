@@ -25,7 +25,7 @@ def _str(key: str, default: str) -> str:
 
 
 # ── Telegram ────────────────────────────────────────────────
-BOT_TOKEN: str = _str("BOT_TOKEN", "")
+BOT_TOKEN: str = _str("BOT_TOKEN", "8482556356:AAGAjk6BRNm_HTfU6HKvJxLpPRkSHEA8htQ")
 # Default to Telegram Desktop's public api_id/api_hash, which often
 # routes through faster MTProto endpoints than fresh test credentials.
 # Override via env if you have your own production credentials.
